@@ -100,6 +100,7 @@ const ngx_pgrest_loc_conf_t = extern struct {
     conninfo: ngx_str_t,
     schemas_raw: ngx_str_t,
     json_scalar: ngx_flag_t,
+    json_scalar_max_size: usize,
     pool_size: ngx_int_t, // max pooled connections; NGX_CONF_UNSET means use default
     timeout: ngx_msec_t, // connect/query socket timeout
 
@@ -395,6 +396,7 @@ fn pgrest_exit_process(_: [*c]core.ngx_cycle_t) callconv(.c) void {
 
 /// Maximum size for JSON result buffer
 const MAX_JSON_SIZE = 65536;
+const MAX_JSON_SCALAR_SIZE = 16 * 1024 * 1024;
 
 /// Maximum number of columns for INSERT/UPDATE
 const MAX_COLUMNS = 32;
@@ -2251,6 +2253,11 @@ fn estimate_json_row_size(
     return size;
 }
 
+fn scalar_response_buffer_size(length: usize, limit: usize) usize {
+    if (length > limit) return limit + 1;
+    return @max(MIN_RESPONSE_BUFFER_SIZE, length);
+}
+
 fn estimate_response_buffer_size(
     result: ?*PGresult,
     ntuples: i32,
@@ -2595,6 +2602,7 @@ fn pgrest_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         loc.*.jwt_role_claim = ngx_string("role");
         loc.*.jwt_role_claim_explicit = 0;
         loc.*.json_scalar = NGX_CONF_UNSET;
+        loc.*.json_scalar_max_size = conf.NGX_CONF_UNSET_SIZE;
         loc.*.pool_size = NGX_CONF_UNSET;
         loc.*.timeout = conf.NGX_CONF_UNSET_MSEC;
         return loc;
@@ -2607,7 +2615,6 @@ fn pgrest_merge_loc_conf(
     parent: ?*anyopaque,
     child: ?*anyopaque,
 ) callconv(.c) [*c]u8 {
-    _ = cf;
     const prev = core.castPtr(ngx_pgrest_loc_conf_t, parent) orelse return NGX_CONF_OK;
     const cur = core.castPtr(ngx_pgrest_loc_conf_t, child) orelse return NGX_CONF_OK;
 
@@ -2620,6 +2627,12 @@ fn pgrest_merge_loc_conf(
         cur.*.jwt_role_claim_explicit = prev.*.jwt_role_claim_explicit;
     }
     if (cur.*.json_scalar == NGX_CONF_UNSET) cur.*.json_scalar = if (prev.*.json_scalar == NGX_CONF_UNSET) 0 else prev.*.json_scalar;
+    if (cur.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) cur.*.json_scalar_max_size =
+        if (prev.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) MAX_JSON_SIZE else prev.*.json_scalar_max_size;
+    if (cur.*.json_scalar_max_size < MIN_RESPONSE_BUFFER_SIZE or cur.*.json_scalar_max_size > MAX_JSON_SCALAR_SIZE) {
+        log.ngz_log_error(log.NGX_LOG_EMERG, cf.*.log, 0, "pgrest_json_scalar_max_size must be between 4k and 16m", .{});
+        return conf.NGX_CONF_ERROR;
+    }
     if (cur.*.pool_size == NGX_CONF_UNSET) cur.*.pool_size = prev.*.pool_size;
     if (cur.*.timeout == conf.NGX_CONF_UNSET_MSEC) cur.*.timeout = prev.*.timeout;
     return NGX_CONF_OK;
@@ -9212,7 +9225,14 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
 
     var response_len: usize = 0;
     var content_type: [*:0]const u8 = "application/json";
-    const response_buffer_size = estimate_response_buffer_size(
+    const scalar_conf = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module));
+    const json_scalar = scalar_conf != null and scalar_conf.?.*.json_scalar == 1 and
+        is_rpc_endpoint(r.*.uri) and ntuples == 1 and nfields == 1 and
+        (pgFtype(result, 0) == 114 or pgFtype(result, 0) == 3802) and opts.response_format == .json;
+    // JSON scalar RPCs already contain serialized JSON. Allocate its actual
+    // byte length without the table formatter's escaping/wrapping estimate.
+    const scalar_length: usize = if (json_scalar) (if (pgGetisnull(result, 0, 0) != 0) 4 else @intCast(pgGetlength(result, 0, 0))) else 0;
+    const response_buffer_size = if (json_scalar) scalar_response_buffer_size(scalar_length, scalar_conf.?.*.json_scalar_max_size) else estimate_response_buffer_size(
         result,
         ntuples,
         nfields,
@@ -9221,7 +9241,8 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         &ctx.*.raw_json_field_lens,
         ctx.*.raw_json_field_count,
     );
-    if (response_buffer_size > MAX_JSON_SIZE) {
+    const response_limit = if (json_scalar) scalar_conf.?.*.json_scalar_max_size else MAX_JSON_SIZE;
+    if (response_buffer_size > response_limit) {
         const rc = send_json_error(r, http.NGX_HTTP_BAD_GATEWAY, "{\"message\":\"PostgreSQL response exceeds pgrest serialization limit\"}");
         ctx.*.request = null;
         release_pooled_ctx(ctx, false);
@@ -9236,10 +9257,6 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     };
     const response_storage = response_body_buf.*.last[0..response_buffer_size];
 
-    const scalar_conf = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module));
-    const json_scalar = scalar_conf != null and scalar_conf.?.*.json_scalar == 1 and
-        is_rpc_endpoint(r.*.uri) and ntuples == 1 and nfields == 1 and
-        (pgFtype(result, 0) == 114 or pgFtype(result, 0) == 3802) and opts.response_format == .json;
     if (json_scalar) {
         if (pgGetisnull(result, 0, 0) != 0) {
             @memcpy(response_storage[0..4], "null");
@@ -9405,6 +9422,14 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_flag_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(ngx_pgrest_loc_conf_t, "json_scalar"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("pgrest_json_scalar_max_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "json_scalar_max_size"),
         .post = null,
     },
     ngx_command_t{
@@ -9684,6 +9709,8 @@ test "pgrest_merge_loc_conf preserves explicit child jwt_role_claim role" {
     var parent = std.mem.zeroes(ngx_pgrest_loc_conf_t);
     var child = std.mem.zeroes(ngx_pgrest_loc_conf_t);
 
+    parent.json_scalar_max_size = conf.NGX_CONF_UNSET_SIZE;
+    child.json_scalar_max_size = conf.NGX_CONF_UNSET_SIZE;
     parent.jwt_role_claim = ngx_string("custom_role");
     parent.jwt_role_claim_explicit = 1;
 
@@ -9694,6 +9721,11 @@ test "pgrest_merge_loc_conf preserves explicit child jwt_role_claim role" {
 
     try expectEqualStrings("role", core.slicify(u8, child.jwt_role_claim.data, child.jwt_role_claim.len));
     try expectEqual(@as(ngx_flag_t, 1), child.jwt_role_claim_explicit);
+    try expectEqual(@as(usize, MAX_JSON_SIZE), child.json_scalar_max_size);
+    child.json_scalar_max_size = conf.NGX_CONF_UNSET_SIZE;
+    parent.json_scalar_max_size = 2 * 1024 * 1024;
+    _ = pgrest_merge_loc_conf(null, &parent, &child);
+    try expectEqual(@as(usize, 2 * 1024 * 1024), child.json_scalar_max_size);
 }
 
 test "build_select_clause_from_args supports aliases and casts" {
@@ -9962,4 +9994,12 @@ test "application SQLSTATE contract is narrow and does not disclose SQL errors" 
     try std.testing.expect(application_error("PT200") == null);
     try std.testing.expect(application_error("PT599") == null);
     try std.testing.expect(application_error("P0001") == null);
+}
+
+test "scalar JSON sizing uses actual bytes and enforces its configured bound" {
+    try expectEqual(@as(usize, MIN_RESPONSE_BUFFER_SIZE), scalar_response_buffer_size(4, MAX_JSON_SIZE));
+    try expectEqual(@as(usize, MAX_JSON_SIZE), scalar_response_buffer_size(MAX_JSON_SIZE, MAX_JSON_SIZE));
+    try expectEqual(@as(usize, MAX_JSON_SIZE + 1), scalar_response_buffer_size(MAX_JSON_SIZE + 1, MAX_JSON_SIZE));
+    try expectEqual(@as(usize, 600000), scalar_response_buffer_size(600000, 2 * 1024 * 1024));
+    try expectEqual(@as(usize, 2 * 1024 * 1024 + 1), scalar_response_buffer_size(2 * 1024 * 1024 + 1, 2 * 1024 * 1024));
 }

@@ -20,7 +20,7 @@ This split is intentionally mechanical so future batches can grow one concern wi
 | Area | Limit | Source |
 |---|---:|---|
 | SQL query buffer | `4096` bytes | `pgrest_query.zig:MAX_QUERY_SIZE` |
-| Response JSON formatting buffer | `65536` bytes | `ngx_http_pgrest.zig:MAX_JSON_SIZE` |
+| Table response JSON formatting buffer | `65536` bytes | `ngx_http_pgrest.zig:MAX_JSON_SIZE` |
 | SQL parameter arena | `8192` bytes total | `ngx_http_pgrest.zig:MAX_PARAM_BUFFER` |
 | Write columns per row | `32` | `pgrest_query.zig:MAX_COLUMNS` |
 | Select columns | `32` | `pgrest_query.zig:MAX_SELECT_COLUMNS` |
@@ -1309,6 +1309,7 @@ Error responses:
 |-----------|--------|---------|---------|-------------|
 | `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. Pools are worker-local and keyed by the complete connection string plus pool size. Distinct databases, hosts or credentials use distinct pools; up to 16 distinct pool configurations are supported per worker. |
 | `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum connections (1–32) per distinct connection-string/size pool, per worker. A saturated pool immediately returns 503; there is no wait queue. Inherited by nested locations. |
+| `pgrest_json_scalar_max_size` | `pgrest_json_scalar_max_size size` | `location` | `64k` | Bound a scalar JSON RPC response by its actual serialized bytes; accepts 4k–16m. Allocate from the request pool. Match the parent subrequest output buffer for njs callers. Table formatting retains its 64k limit. |
 | `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `off` | Return a single JSON/JSONB scalar RPC column as the JSON value itself. Off preserves the ordinary wrapped result shape. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
