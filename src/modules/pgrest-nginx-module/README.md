@@ -1309,7 +1309,7 @@ Error responses:
 |-----------|--------|---------|---------|-------------|
 | `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. Pools are worker-local and keyed by the complete connection string plus pool size. Distinct databases, hosts or credentials use distinct pools; up to 16 distinct pool configurations are supported per worker. |
 | `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum connections (1–32) per distinct connection-string/size pool, per worker. A saturated pool immediately returns 503; there is no wait queue. Inherited by nested locations. |
-| `pgrest_json_scalar_max_size` | `pgrest_json_scalar_max_size size` | `location` | `64k` | Bound a scalar JSON RPC response by its actual serialized bytes; accepts 4k–16m. Allocate from the request pool. Match the parent subrequest output buffer for njs callers. Table formatting retains its 64k limit. |
+| `pgrest_json_scalar_max_size` | `pgrest_json_scalar_max_size size` | `location` | `64k` | Bound a scalar JSON RPC response by its actual serialized bytes; accepts 512 bytes–16m. Allocate from the request pool. Match the subrequest target's output buffer for njs callers, or set that buffer at `http` scope. Table formatting retains its 64k limit. |
 | `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `off` | Return a single JSON/JSONB scalar RPC column as the JSON value itself. Off preserves the ordinary wrapped result shape. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
@@ -1352,6 +1352,24 @@ parameters, and JSON RPC bodies at or above 4096 bytes are rejected instead of
 silently truncating. Application SQLSTATE values PT400/401/403/404/409/422/429/503
 map to their HTTP statuses with generic error text; unrecognized states remain
 server errors.
+
+### Scalar JSON response regression tests
+
+```sh
+ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest
+```
+
+The scalar suites cover JSON and JSONB, exact byte bounds and one-byte-over
+rejections, the unchanged default 64k limit, nested location inheritance and
+overrides, disabled scalar mode, ordinary result shapes, response negotiation,
+invalid directive values/arguments/contexts, and connection-pool recovery after
+repeated oversized responses. njs checks verify complete large responses and
+propagated errors followed by successful requests.
+
+The container suite reuses `pgrest-nginz-test` on port 5432, with its own temporary
+database and role. UTF-8 boundary checks use real PostgreSQL because the existing
+mock encodes row lengths as JavaScript character counts. Both suites use the
+unchanged shared harness and fixture runtime paths for logs and pid files.
 
 ### Runtime diagnostics
 
