@@ -48,12 +48,52 @@ export class PostgresMock {
         data: (socket, data) => this.handleData(socket, data),
         open: (socket) => {
           socket.pgState = "startup";
+          socket.pgPendingWrites = [];
+          socket.pgWriteBlocked = false;
+          socket.pgWriteClosed = false;
         },
-        close: (socket) => {},
+        drain: (socket) => {
+          socket.pgWriteBlocked = false;
+          this.flushWrites(socket);
+        },
+        close: (socket) => {
+          socket.pgWriteClosed = true;
+          socket.pgPendingWrites = [];
+        },
         error: (socket, error) => console.error("PostgreSQL mock error:", error),
       },
     });
     return this;
+  }
+
+  // Bun TCP writes are unbuffered: retain partial frames and resume on drain.
+  // Every protocol message shares the queue, so ReadyForQuery cannot overtake
+  // an unfinished DataRow on machines with smaller socket send buffers.
+  write(socket, data) {
+    if (socket.pgWriteClosed) return;
+    socket.pgPendingWrites ??= [];
+    socket.pgPendingWrites.push(data);
+    if (!socket.pgWriteBlocked) this.flushWrites(socket);
+  }
+
+  flushWrites(socket) {
+    if (socket.pgWriteClosed) return;
+    const queue = socket.pgPendingWrites;
+    while (queue?.length) {
+      const pending = queue[0];
+      const written = socket.write(pending);
+      if (written < 0) {
+        socket.pgWriteClosed = true;
+        socket.pgPendingWrites = [];
+        return;
+      }
+      if (written < pending.length) {
+        queue[0] = pending.subarray(written);
+        socket.pgWriteBlocked = true;
+        return;
+      }
+      queue.shift();
+    }
   }
 
   stop() {
@@ -135,7 +175,7 @@ export class PostgresMock {
     // SSL request (80877103)
     if (version === 80877103) {
       // Reject SSL with 'N'
-      socket.write(Buffer.from("N"));
+      this.write(socket, Buffer.from("N"));
       return;
     }
 
@@ -150,7 +190,7 @@ export class PostgresMock {
       }
 
       // Send AuthenticationOk (R\0\0\0\8\0\0\0\0)
-      socket.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]));
+      this.write(socket, Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]));
 
       // Send ParameterStatus messages
       this.sendParameterStatus(socket, "server_version", "15.0");
@@ -163,10 +203,10 @@ export class PostgresMock {
       keyData.writeInt32BE(12, 1); // length
       keyData.writeInt32BE(1234, 5); // process ID
       keyData.writeInt32BE(5678, 9); // secret key
-      socket.write(keyData);
+      this.write(socket, keyData);
 
       // Send ReadyForQuery
-      socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); // 'Z' + length + 'I' (idle)
+      this.write(socket, Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); // 'Z' + length + 'I' (idle)
 
       socket.pgState = "ready";
     }
@@ -181,7 +221,7 @@ export class PostgresMock {
     buf[5 + name.length] = 0;
     buf.write(value, 5 + name.length + 1);
     buf[5 + name.length + 1 + value.length] = 0;
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   // Send a PostgreSQL ErrorResponse during startup (before AuthenticationOk).
@@ -199,7 +239,7 @@ export class PostgresMock {
     buf[0] = 0x45; // 'E'
     buf.writeInt32BE(len, 1);
     buf.write(body, 5);
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   handleMessage(socket, buf) {
@@ -224,7 +264,7 @@ export class PostgresMock {
         socket.extendedQuery = body.toString("utf8", stmtEnd + 1, queryEnd);
         socket.extendedParams = [];
         // Send ParseComplete
-        socket.write(Buffer.from([0x31, 0, 0, 0, 4]));
+        this.write(socket, Buffer.from([0x31, 0, 0, 0, 4]));
         break;
       }
 
@@ -250,13 +290,13 @@ export class PostgresMock {
         }
         socket.extendedParams = params;
         // Send BindComplete
-        socket.write(Buffer.from([0x32, 0, 0, 0, 4]));
+        this.write(socket, Buffer.from([0x32, 0, 0, 0, 4]));
         break;
       }
 
       case "D": // Describe
         // Send NoData
-        socket.write(Buffer.from([0x6e, 0, 0, 0, 4]));
+        this.write(socket, Buffer.from([0x6e, 0, 0, 0, 4]));
         break;
 
       case "E": { // Execute — run the bound query with substituted parameters
@@ -278,7 +318,7 @@ export class PostgresMock {
 
       case "S": // Sync
         // Send ReadyForQuery
-        socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49]));
+        this.write(socket, Buffer.from([0x5a, 0, 0, 0, 5, 0x49]));
         break;
 
       default:
@@ -287,7 +327,7 @@ export class PostgresMock {
   }
 
   handleQuery(socket, query, sendReady = true) {
-    const rfq = () => { if (sendReady) socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
+    const rfq = () => { if (sendReady) this.write(socket, Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
 
     // Log all queries for debugging
     this.queryLog.push(query);
@@ -356,7 +396,7 @@ export class PostgresMock {
   // Handle a single-statement query (the old handleQuery logic).
   handleSingleQuery(socket, query, sendReady = true) {
     const upperQuery = query.toUpperCase().trim();
-    const rfq = () => { if (sendReady) socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
+    const rfq = () => { if (sendReady) this.write(socket, Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
 
     // Track RESET ROLE commands (always first in every request's query chain)
     if (/^RESET\s+ROLE\s*$/i.test(query.trim())) {
@@ -513,7 +553,7 @@ export class PostgresMock {
       offset += 2;
     }
 
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   sendDataRow(socket, row) {
@@ -548,7 +588,7 @@ export class PostgresMock {
       }
     }
 
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   sendCommandComplete(socket, tag) {
@@ -558,7 +598,7 @@ export class PostgresMock {
     buf.writeInt32BE(len, 1);
     buf.write(tag, 5);
     buf[5 + tag.length] = 0;
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   sendError(socket, error) {
@@ -629,7 +669,7 @@ export class PostgresMock {
 
     buf[offset++] = 0; // terminator
 
-    socket.write(buf);
+    this.write(socket, buf);
   }
 
   // Helper methods for test setup

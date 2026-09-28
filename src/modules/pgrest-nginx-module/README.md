@@ -1371,6 +1371,19 @@ database and role. UTF-8 boundary checks use real PostgreSQL because the existin
 mock encodes row lengths as JavaScript character counts. Both suites use the
 unchanged shared harness and fixture runtime paths for logs and pid files.
 
+Container SQL helpers use the current user's Docker access, falling back to
+noninteractive `sudo -n docker` when needed. Docker access failures are reported
+separately from a stopped test container; the fixtures never prompt for passwords.
+
+The PostgreSQL mock queues unsent bytes and resumes writes on `drain`. Bun's
+[TCP writes](https://bun.com/docs/runtime/networking/tcp) are unbuffered, so a
+large response must not assume that one write sends the whole frame. The shared
+transport regressions force partial writes, zero writes, and closed sockets:
+
+```sh
+ZIG_OPTIMIZE=ReleaseSmall bun test tests/mocks/postgres.test.js
+```
+
 ### Runtime diagnostics
 
 Routine pooled-connection state events (`pgrest-trace` and `pgrest-watch`) are

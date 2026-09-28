@@ -1,3 +1,4 @@
+import { dockerCommand } from "../docker.js";
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
 
@@ -34,7 +35,7 @@ function run(command) {
 }
 
 function ensureContainerRunning(name) {
-  const result = runResult(["sudo", "docker", "inspect", "--format", "{{.State.Running}}", name]);
+  const result = runResult([...dockerCommand(), "inspect", "--format", "{{.State.Running}}", name]);
   if (result.exitCode !== 0 || !result.stdout.trim().includes("true")) {
     throw new Error(`Container ${name} is not running. Start it before running container tests.`);
   }
@@ -50,7 +51,7 @@ function ensureHostPortOpen(host, port) {
 // Run SQL as the postgres superuser (trust from inside the container).
 function psqlAdmin(sql) {
   const result = Bun.spawnSync(
-    ["sudo", "docker", "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres"],
+    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres"],
     { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
@@ -63,7 +64,7 @@ function psqlAdmin(sql) {
 
 function psqlAdminDb(sql) {
   const result = Bun.spawnSync(
-    ["sudo", "docker", "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres", "-d", PG_DB],
+    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres", "-d", PG_DB],
     { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
@@ -77,7 +78,7 @@ function psqlAdminDb(sql) {
 // Run SQL as the test user against the test database.
 function psqlDb(sql) {
   const result = Bun.spawnSync(
-    ["sudo", "docker", "exec", "-i", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB],
+    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB],
     { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
@@ -228,7 +229,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
     // Create test user and database
     psqlAdmin(`CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASSWORD}';`);
-    run(["sudo", "docker", "exec", PG_CONTAINER, "createdb", "-U", "postgres", `--owner=${PG_USER}`, PG_DB]);
+    run([...dockerCommand(), "exec", PG_CONTAINER, "createdb", "-U", "postgres", `--owner=${PG_USER}`, PG_DB]);
     psqlDb(SETUP_SQL);
     psqlAdminDb(RESTRICTED_SQL);
 
@@ -238,7 +239,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   afterAll(async () => {
     await stopNginz();
 
-    try { run(["sudo", "docker", "exec", PG_CONTAINER, "dropdb", "-U", "postgres", "--if-exists", PG_DB]); } catch {}
+    try { run([...dockerCommand(), "exec", PG_CONTAINER, "dropdb", "-U", "postgres", "--if-exists", PG_DB]); } catch {}
     try { psqlAdmin(`DROP USER IF EXISTS ${PG_USER};`); } catch {}
 
     cleanupRuntime(MODULE);

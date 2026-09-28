@@ -1,3 +1,4 @@
+import { dockerCommand } from "../docker.js";
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ const LIMIT_ERROR = { message: "PostgreSQL response exceeds pgrest serialization
 
 function psql(sql, database = "postgres") {
   const result = Bun.spawnSync([
-    "sudo", "-n", "docker", "exec", "-i", PG_CONTAINER,
+    ...dockerCommand(), "exec", "-i", PG_CONTAINER,
     "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database,
   ], { stdin: Buffer.from(sql), stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) {
