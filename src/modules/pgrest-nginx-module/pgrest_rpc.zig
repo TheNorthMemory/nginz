@@ -1,4 +1,5 @@
 const std = @import("std");
+const pgrest_sql = @import("pgrest_sql.zig");
 const ngx = @import("ngx");
 const pgrest_query = @import("pgrest_query.zig");
 
@@ -33,6 +34,7 @@ pub const RpcParam = struct {
     is_numeric: bool = false,
     is_boolean: bool = false,
     is_raw: bool = false,
+    is_variadic: bool = false,
     value_buf: [2048]u8 = std.mem.zeroes([2048]u8),
 };
 
@@ -40,6 +42,7 @@ pub const RpcCall = struct {
     function_name: []const u8,
     params: [MAX_RPC_PARAMS]RpcParam,
     param_count: usize,
+    invalid_params: bool = false,
     prefer_single_object: bool = false,
     raw_body: [4096]u8 = std.mem.zeroes([4096]u8),
     raw_body_len: usize = 0,
@@ -287,24 +290,37 @@ pub fn collapse_rpc_variadic_param(rpc_call: *RpcCall, metadata: *const RpcMetad
             match_count += 1;
         }
     }
-    if (match_count <= 1) return;
+    if (match_count == 0) return;
+    rpc_call.params[match_indexes[0]].is_variadic = true;
+    if (match_count == 1) return;
 
     const first_index = match_indexes[0];
     var pos: usize = 0;
     const prefix = "ARRAY[";
-    @memcpy(rpc_call.params[first_index].value_buf[pos..][0..prefix.len], prefix);
+    var array_buf: [2048]u8 = undefined;
+    @memcpy(array_buf[pos..][0..prefix.len], prefix);
     pos += prefix.len;
 
     for (match_indexes[0..match_count], 0..) |param_index, arr_i| {
+        const param = rpc_call.params[param_index];
+        const value_len = if (param.is_raw or param.is_boolean or param.is_numeric or param.is_null)
+            param.value.len
+        else
+            pgrest_sql.literal_size(param.value);
+        if (pos + value_len + 2 >= array_buf.len) {
+            rpc_call.invalid_params = true;
+            return;
+        }
         if (arr_i > 0) {
-            rpc_call.params[first_index].value_buf[pos] = ',';
+            array_buf[pos] = ',';
             pos += 1;
         }
-        pos = append_variadic_scalar(rpc_call.params[first_index].value_buf[0..], pos, rpc_call.params[param_index]);
+        pos = append_variadic_scalar(&array_buf, pos, param);
     }
 
-    rpc_call.params[first_index].value_buf[pos] = ']';
+    array_buf[pos] = ']';
     pos += 1;
+    @memcpy(rpc_call.params[first_index].value_buf[0..pos], array_buf[0..pos]);
     rpc_call.params[first_index].value = rpc_call.params[first_index].value_buf[0..pos];
     rpc_call.params[first_index].is_null = false;
     rpc_call.params[first_index].is_numeric = false;
@@ -324,27 +340,16 @@ pub fn collapse_rpc_variadic_param(rpc_call: *RpcCall, metadata: *const RpcMetad
             }
         }
         if (skip) continue;
-        if (new_count != i) rpc_call.params[new_count] = rpc_call.params[i];
+        if (new_count != i) {
+            rpc_call.params[new_count] = rpc_call.params[i];
+        }
         new_count += 1;
     }
     rpc_call.param_count = new_count;
 }
 
 fn write_ident_quoted(buf_out: []u8, pos_in: usize, ident: []const u8) usize {
-    var pos = pos_in;
-    buf_out[pos] = '"';
-    pos += 1;
-    for (ident) |c| {
-        if (c == '"') {
-            buf_out[pos] = '"';
-            pos += 1;
-        }
-        buf_out[pos] = c;
-        pos += 1;
-    }
-    buf_out[pos] = '"';
-    pos += 1;
-    return pos;
+    return pgrest_sql.append_quoted_identifier(buf_out, pos_in, ident);
 }
 
 pub fn build_rpc_table_query(
@@ -394,9 +399,13 @@ pub fn build_rpc_table_query(
         }
 
         const param = rpc_params.params[i];
+        if (param.is_variadic) {
+            const variadic = "VARIADIC ";
+            @memcpy(query_buf[pos..][0..variadic.len], variadic);
+            pos += variadic.len;
+        }
         if (param.name.len > 0) {
-            @memcpy(query_buf[pos..][0..param.name.len], param.name);
-            pos += param.name.len;
+            pos = pgrest_sql.append_identifier(query_buf, pos, param.name);
             query_buf[pos] = ' ';
             pos += 1;
             query_buf[pos] = '=';

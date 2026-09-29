@@ -222,7 +222,7 @@ describe("pgrest module", () => {
       rows: [["1", "A-"]],
     }));
 
-    pgMock.setQueryHandler(/^SELECT id,full_name AS fullName,birth_date AS birthDate,salary::text FROM users$/, () => ({
+    pgMock.setQueryHandler(/^SELECT id,full_name AS "fullName",birth_date AS "birthDate",salary::text FROM users$/, () => ({
       columns: ["id", "fullName", "birthDate", "salary"],
       rows: [["1", "John Doe", "1988-04-25", "90000.00"]],
     }));
@@ -481,7 +481,7 @@ describe("pgrest module", () => {
 
     pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'import_csv'.*LIMIT 1/, () => ({
       columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["v", "f", "f", "f", "1", "text", "", "", "1"]],
+      rows: [["v", "f", "f", "f", "0", "", "", "data", "0"]],
     }));
 
     pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'upload_blob'.*LIMIT 1/, () => ({
@@ -509,7 +509,7 @@ describe("pgrest module", () => {
       rows: [["8"]],
     }));
 
-    pgMock.setQueryHandler(/SELECT plus_one\(v => ARRAY\[1,2,3,4\]\)/, () => ({
+    pgMock.setQueryHandler(/SELECT plus_one\(VARIADIC v => ARRAY\[1,2,3,4\]\)/, () => ({
       columns: ["plus_one"],
       rows: [["{2,3,4,5}"]],
     }));
@@ -825,7 +825,7 @@ describe("pgrest module", () => {
       birthDate: "1988-04-25",
       salary: "90000.00",
     });
-    expect(lastSql()).toBe("SELECT id,full_name AS fullName,birth_date AS birthDate,salary::text FROM users");
+    expect(lastSql()).toBe('SELECT id,full_name AS "fullName",birth_date AS "birthDate",salary::text FROM users');
   });
 
   test("GET /api/orders supports grouped aggregates with alias and output cast", async () => {
@@ -1684,7 +1684,7 @@ describe("pgrest module", () => {
     expect(lastSql()).toBe("SELECT add_them(a => 1, b => 2)");
   });
 
-  test("POST /rpc/add_them with unsupported request media type returns 415", async () => {
+  test("POST /rpc/add_them rejects raw text for named numeric arguments", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
@@ -1695,8 +1695,9 @@ describe("pgrest module", () => {
       body: "a=1",
     });
 
-    expect(res.status).toBe(200);
-    expect(lastSql()).toBe("SELECT add_them(data => 'a=1')");
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe("invalid_rpc_parameters");
+    expect(lastSql()).not.toContain("SELECT add_them(");
   });
 
   test("POST /rpc/import_csv with text/csv body maps raw payload into data parameter", async () => {
@@ -1768,7 +1769,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/rpc/plus_one?v=1&v=2&v=3&v=4`);
     expect(res.status).toBe(200);
-    expect(lastSql()).toBe("SELECT plus_one(v => ARRAY[1,2,3,4])");
+    expect(lastSql()).toBe("SELECT plus_one(VARIADIC v => ARRAY[1,2,3,4])");
     expect(await res.text()).toContain("{2,3,4,5}");
   });
 
@@ -1880,7 +1881,7 @@ describe("pgrest module", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(lastSql()).toBe("SELECT plus_one(v => ARRAY[1,2,3,4])");
+    expect(lastSql()).toBe("SELECT plus_one(VARIADIC v => ARRAY[1,2,3,4])");
     expect(await res.text()).toContain("{2,3,4,5}");
   });
 
@@ -2487,10 +2488,20 @@ describe("pgrest module", () => {
       expect(retainedStatus).toBe(true);
 
       await reloadNginz();
-      const afterReload = await fetchClose(`${TEST_URL}/backend-32/users`, {
-        headers: { Connection: "close" },
-      });
-      expect(afterReload.status).toBe(200);
+      // The shared listening socket can still dispatch to the retiring
+      // generation briefly. Wait for a fresh worker, rather than racing reload.
+      let afterReloadStatus;
+      const deadline = Date.now() + 3000;
+      do {
+        const afterReload = await fetchClose(`${TEST_URL}/backend-32/users`, {
+          headers: { Connection: "close" },
+        });
+        afterReloadStatus = afterReload.status;
+        await afterReload.arrayBuffer();
+        if (afterReloadStatus === 200) break;
+        await Bun.sleep(50);
+      } while (Date.now() < deadline);
+      expect(afterReloadStatus).toBe(200);
 
       // Retiring workers must return libpq's nginx connection wrappers before
       // exit. Otherwise nginx reports "open socket ... left in connection" on

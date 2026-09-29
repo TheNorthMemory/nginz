@@ -1,5 +1,6 @@
 const std = @import("std");
 const ngx = @import("ngx");
+const pgrest_sql = @import("pgrest_sql.zig");
 
 const core = ngx.core;
 const http = ngx.http;
@@ -227,20 +228,7 @@ pub fn trim_ascii_spaces(value: []const u8) []const u8 {
 }
 
 pub fn append_sql_quoted(buf_out: []u8, pos_in: usize, value: []const u8) usize {
-    var pos = pos_in;
-    buf_out[pos] = '\'';
-    pos += 1;
-    for (value) |c| {
-        if (c == '\'') {
-            buf_out[pos] = '\'';
-            pos += 1;
-        }
-        buf_out[pos] = c;
-        pos += 1;
-    }
-    buf_out[pos] = '\'';
-    pos += 1;
-    return pos;
+    return pgrest_sql.append_literal(buf_out, pos_in, value);
 }
 
 pub fn is_valid_schema_identifier(value: []const u8) bool {
@@ -256,14 +244,12 @@ pub fn build_qualified_table_name(buffer: []u8, schema: ?[]const u8, table: []co
     var pos: usize = 0;
     if (schema) |s| {
         if (s.len > 0) {
-            @memcpy(buffer[pos..][0..s.len], s);
-            pos += s.len;
+            pos = pgrest_sql.append_identifier(buffer, pos, s);
             buffer[pos] = '.';
             pos += 1;
         }
     }
-    @memcpy(buffer[pos..][0..table.len], table);
-    pos += table.len;
+    pos = pgrest_sql.append_identifier(buffer, pos, table);
     return pos;
 }
 
@@ -320,35 +306,10 @@ fn unescape_wrapped_quotes_into(dest: []u8, value: []const u8) ?[]const u8 {
     return dest[0..pos];
 }
 
-fn is_simple_identifier(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
-    }
-    return true;
-}
-
 fn append_sql_identifier(buf_out: []u8, pos_in: usize, raw_value: []const u8) usize {
     var scratch: [512]u8 = undefined;
     const value = unescape_wrapped_quotes_into(&scratch, raw_value) orelse raw_value;
-    if (is_simple_identifier(value)) {
-        @memcpy(buf_out[pos_in..][0..value.len], value);
-        return pos_in + value.len;
-    }
-    var pos = pos_in;
-    buf_out[pos] = '"';
-    pos += 1;
-    for (value) |c| {
-        if (c == '"') {
-            buf_out[pos] = '"';
-            pos += 1;
-        }
-        buf_out[pos] = c;
-        pos += 1;
-    }
-    buf_out[pos] = '"';
-    pos += 1;
-    return pos;
+    return pgrest_sql.append_identifier(buf_out, pos_in, value);
 }
 
 fn append_castable_expression(buf_out: []u8, pos_in: usize, raw_expr: []const u8) ?usize {
@@ -749,8 +710,7 @@ pub fn build_where_clause_from_filters(buf_out: []u8, filters: []const Filter) u
             @memcpy(buf_out[pos..][0..and_str.len], and_str);
             pos += and_str.len;
         }
-        @memcpy(buf_out[pos..][0..filter.column.len], filter.column);
-        pos += filter.column.len;
+        pos = pgrest_sql.append_identifier(buf_out, pos, filter.column);
         buf_out[pos] = ' ';
         pos += 1;
         const op_sql = filter.op.toSql();
@@ -1461,8 +1421,7 @@ pub fn build_sql_query(query_buf: []u8, sql_op: SqlOp, table: []const u8, where_
                         query_buf[pos] = ',';
                         pos += 1;
                     }
-                    @memcpy(query_buf[pos..][0..field.name.len], field.name);
-                    pos += field.name.len;
+                    pos = pgrest_sql.append_identifier(query_buf, pos, field.name);
                 }
                 query_buf[pos] = ')';
                 pos += 1;
@@ -1513,8 +1472,7 @@ pub fn build_sql_query(query_buf: []u8, sql_op: SqlOp, table: []const u8, where_
                         query_buf[pos] = ',';
                         pos += 1;
                     }
-                    @memcpy(query_buf[pos..][0..field.name.len], field.name);
-                    pos += field.name.len;
+                    pos = pgrest_sql.append_identifier(query_buf, pos, field.name);
                     query_buf[pos] = '=';
                     pos += 1;
                     if (field.is_null) {
@@ -1712,8 +1670,7 @@ pub fn build_limited_write_query(query_buf: []u8, sql_op: SqlOp, table: []const 
                     query_buf[pos] = ',';
                     pos += 1;
                 }
-                @memcpy(query_buf[pos..][0..field.name.len], field.name);
-                pos += field.name.len;
+                pos = pgrest_sql.append_identifier(query_buf, pos, field.name);
                 query_buf[pos] = '=';
                 pos += 1;
                 if (field.is_null) {
@@ -1764,8 +1721,7 @@ pub fn build_insert_rows_query(query_buf: []u8, table: []const u8, column_names:
             query_buf[pos] = ',';
             pos += 1;
         }
-        @memcpy(query_buf[pos..][0..name.len], name);
-        pos += name.len;
+        pos = pgrest_sql.append_identifier(query_buf, pos, name);
     }
     query_buf[pos] = ')';
     pos += 1;
@@ -1798,8 +1754,7 @@ pub fn build_insert_rows_query(query_buf: []u8, table: []const u8, column_names:
                 query_buf[pos] = ',';
                 pos += 1;
             }
-            @memcpy(query_buf[pos..][0..name.len], name);
-            pos += name.len;
+            pos = pgrest_sql.append_identifier(query_buf, pos, name);
         }
         query_buf[pos] = ')';
         pos += 1;
@@ -1813,15 +1768,13 @@ pub fn build_insert_rows_query(query_buf: []u8, table: []const u8, column_names:
                         query_buf[pos] = ',';
                         pos += 1;
                     }
-                    @memcpy(query_buf[pos..][0..name.len], name);
-                    pos += name.len;
+                    pos = pgrest_sql.append_identifier(query_buf, pos, name);
                     query_buf[pos] = '=';
                     pos += 1;
                     const excluded = "EXCLUDED.";
                     @memcpy(query_buf[pos..][0..excluded.len], excluded);
                     pos += excluded.len;
-                    @memcpy(query_buf[pos..][0..name.len], name);
-                    pos += name.len;
+                    pos = pgrest_sql.append_identifier(query_buf, pos, name);
                 }
             },
             .ignore_duplicates => {
@@ -1933,7 +1886,7 @@ test "build_select_clause_from_args supports aliases and casts" {
     var buf_out: [512]u8 = undefined;
     const result = build_select_clause_from_args(&buf_out, ngx_string("select=fullName:full_name,birthDate:birth_date,salary::text"));
     try std.testing.expect(!result.invalid);
-    try std.testing.expectEqualStrings("full_name AS fullName,birth_date AS birthDate,salary::text", buf_out[0..result.len]);
+    try std.testing.expectEqualStrings("full_name AS \"fullName\",birth_date AS \"birthDate\",salary::text", buf_out[0..result.len]);
 }
 
 test "build_select_clause_from_args supports json and array paths" {
@@ -1992,7 +1945,7 @@ test "build_insert_rows_query renders merge duplicates upsert" {
         .{ .value = "Sara B.", .is_null = false, .is_number = false, .is_boolean = false, .use_default = false },
     };
     const rows = [_][]const WriteScalar{row[0..]};
-    const len = build_insert_rows_query(&query_buf, "users", &.{ "id", "name" }, rows[0..], &.{ "id" }, .merge_duplicates, true);
+    const len = build_insert_rows_query(&query_buf, "users", &.{ "id", "name" }, rows[0..], &.{"id"}, .merge_duplicates, true);
     try std.testing.expectEqualStrings("INSERT INTO users (id,name) VALUES (1,'Sara B.') ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name RETURNING *", query_buf[0..len]);
 }
 

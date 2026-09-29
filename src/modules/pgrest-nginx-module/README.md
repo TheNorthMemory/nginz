@@ -10,6 +10,7 @@ The pgrest implementation is no longer a single growing file. The current split 
 - `pgrest_auth.zig` - JWT extraction/validation and query helpers with Zig tests
 - `pgrest_query.zig` - SQL grammar, table query builders, and write-query helpers with Zig tests
 - `pgrest_rpc.zig` - RPC metadata/query-shaping helpers with Zig tests
+- `pgrest_sql.zig` - shared SQL identifier and literal escaping
 
 This split is intentionally mechanical so future batches can grow one concern without dragging the whole module into context.
 
@@ -303,6 +304,32 @@ $$ LANGUAGE SQL;
 Both approaches allow PostgreSQL functions to access JWT data for authorization decisions.
 
 ## RPC (Remote Procedure Call) - Stored Procedures
+
+### SQL construction and authentication
+
+Request string/JSON values use libpq parameters. Schema, table, column,
+function and RPC argument names are emitted as identifiers with double quotes
+escaped. Simple lowercase identifiers retain their existing SQL spelling.
+Named RPC arguments must also match the input names in the function metadata
+already fetched for that request; unknown or duplicate non-variadic arguments
+return 400. An unnamed JSON argument only accepts a JSON body, so a form body
+cannot fall through to named-argument SQL generation (415).
+
+Generated array elements and catalog/session literals escape both quotes and
+backslashes, including when `standard_conforming_strings` is off. Parameter
+budget exhaustion returns 400 rather than switching to inline request values.
+
+Native JWT authenticates the caller; it does not make authenticated input safe
+to concatenate into SQL. Keep signature, expiry and application/role claim
+checks enabled, and use restricted database roles. A WAF can provide additional
+signature-based detection, but safe SQL construction is enforced by pgrest
+itself and requires no WAF, njs, Redis or extra database requests.
+
+The real-PostgreSQL security suite is
+`bun test tests/pgrest/pgrest.security.container.test.js`. It reuses the existing
+`pgrest-nginz-test` container, creates only its own temporary database/roles,
+and covers authenticated attacks, JWT rejection, fixed app-style RPC routes,
+table writes, arrays, parameter overflow, and valid-request recovery.
 
 Call PostgreSQL stored functions and procedures via HTTP endpoints. Perfect for complex operations involving multiple tables or business logic.
 

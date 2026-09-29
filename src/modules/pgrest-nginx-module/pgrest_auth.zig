@@ -1,5 +1,6 @@
 const std = @import("std");
 const ngx = @import("ngx");
+const pgrest_sql = @import("pgrest_sql.zig");
 
 const ssl = ngx.ssl;
 const core = ngx.core;
@@ -226,134 +227,42 @@ pub fn build_clear_jwt_query(query_buf: []u8) ?usize {
     return q.len;
 }
 
+fn append_setting(query_buf: []u8, start: usize, prefix: []const u8, value: []const u8) ?usize {
+    if (start + prefix.len + pgrest_sql.literal_size(value) >= query_buf.len) return null;
+    @memcpy(query_buf[start..][0..prefix.len], prefix);
+    return pgrest_sql.append_literal(query_buf, start + prefix.len, value);
+}
+
 pub fn build_set_postgresql_jwt_claim_query(jwt_token: []const u8, query_buf: []u8) ?usize {
     if (jwt_token.len == 0) return null;
-
-    var pos: usize = 0;
-    const set_prefix = "SET request.jwt TO '";
-    if (set_prefix.len + jwt_token.len + 4 > query_buf.len) return null;
-    @memcpy(query_buf[pos..][0..set_prefix.len], set_prefix);
-    pos += set_prefix.len;
-
-    for (jwt_token) |c| {
-        if (pos >= query_buf.len - 2) return null;
-        if (c == '\'') {
-            if (pos >= query_buf.len - 3) return null;
-            query_buf[pos] = '\'';
-            pos += 1;
-            query_buf[pos] = '\'';
-            pos += 1;
-        } else {
-            query_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    if (pos >= query_buf.len - 1) return null;
-    query_buf[pos] = '\'';
-    pos += 1;
+    const pos = append_setting(query_buf, 0, "SET request.jwt TO ", jwt_token) orelse return null;
     query_buf[pos] = 0;
     return pos;
 }
 
-/// Build a combined multi-statement query for the JWT/role setup phase.
-/// The result is RESET ROLE; SET request.jwt TO '<token or empty>'; [SET ROLE '<role>';]
-/// This replaces up to three sequential round-trips with a single query.
+/// All role/JWT setup statements share one round-trip. Literals must also be
+/// safe when PostgreSQL uses non-standard string escaping.
 pub fn build_combined_jwt_setup_query(query_buf: []u8, jwt_token: ?[]const u8, role_to_set: ?[]const u8) ?usize {
-    var pos: usize = 0;
-
-    // RESET ROLE;
     const reset = "RESET ROLE; ";
-    if (reset.len > query_buf.len - pos) return null;
-    @memcpy(query_buf[pos..][0..reset.len], reset);
-    pos += reset.len;
-
-    // SET request.jwt TO '...';
-    const jwt_prefix = "SET request.jwt TO '";
-    if (jwt_prefix.len > query_buf.len - pos) return null;
-    @memcpy(query_buf[pos..][0..jwt_prefix.len], jwt_prefix);
-    pos += jwt_prefix.len;
-
-    if (jwt_token) |token| {
-        for (token) |c| {
-            if (pos >= query_buf.len - 3) return null;
-            if (c == '\'') {
-                query_buf[pos] = '\'';
-                pos += 1;
-                query_buf[pos] = '\'';
-                pos += 1;
-            } else {
-                query_buf[pos] = c;
-                pos += 1;
-            }
-        }
-    }
-
-    if (pos >= query_buf.len - 3) return null;
-    query_buf[pos] = '\'';
-    pos += 1;
-    query_buf[pos] = ';';
-    pos += 1;
-    query_buf[pos] = ' ';
-    pos += 1;
-
-    // SET ROLE '...'; (conditional)
+    if (reset.len >= query_buf.len) return null;
+    @memcpy(query_buf[0..reset.len], reset);
+    var pos = append_setting(query_buf, reset.len, "SET request.jwt TO ", jwt_token orelse "") orelse return null;
+    if (pos + 2 >= query_buf.len) return null;
+    @memcpy(query_buf[pos..][0..2], "; ");
+    pos += 2;
     if (role_to_set) |role| {
-        const role_prefix = "SET ROLE '";
-        if (role_prefix.len > query_buf.len - pos) return null;
-        @memcpy(query_buf[pos..][0..role_prefix.len], role_prefix);
-        pos += role_prefix.len;
-
-        for (role) |c| {
-            if (pos >= query_buf.len - 3) return null;
-            if (c == '\'') {
-                query_buf[pos] = '\'';
-                pos += 1;
-                query_buf[pos] = '\'';
-                pos += 1;
-            } else {
-                query_buf[pos] = c;
-                pos += 1;
-            }
-        }
-
-        if (pos >= query_buf.len - 2) return null;
-        query_buf[pos] = '\'';
-        pos += 1;
+        pos = append_setting(query_buf, pos, "SET ROLE ", role) orelse return null;
+        if (pos + 1 >= query_buf.len) return null;
         query_buf[pos] = ';';
         pos += 1;
     }
-
     query_buf[pos] = 0;
     return pos;
 }
 
 pub fn build_set_postgresql_role_query(role: []const u8, query_buf: []u8) ?usize {
     if (role.len == 0) return null;
-
-    var pos: usize = 0;
-    const set_prefix = "SET ROLE '";
-    if (set_prefix.len + role.len + 4 > query_buf.len) return null;
-    @memcpy(query_buf[pos..][0..set_prefix.len], set_prefix);
-    pos += set_prefix.len;
-
-    for (role) |c| {
-        if (pos >= query_buf.len - 2) return null;
-        if (c == '\'') {
-            if (pos >= query_buf.len - 3) return null;
-            query_buf[pos] = '\'';
-            pos += 1;
-            query_buf[pos] = '\'';
-            pos += 1;
-        } else {
-            query_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    if (pos >= query_buf.len - 1) return null;
-    query_buf[pos] = '\'';
-    pos += 1;
+    const pos = append_setting(query_buf, 0, "SET ROLE ", role) orelse return null;
     query_buf[pos] = 0;
     return pos;
 }
