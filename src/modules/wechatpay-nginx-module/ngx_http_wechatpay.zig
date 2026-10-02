@@ -11,6 +11,7 @@ const file = ngx.file;
 const cjson = ngx.cjson;
 const CJSON = cjson.CJSON;
 const xpay = @import("xpay.zig");
+const notify = @import("notify.zig");
 
 const NGX_OK = core.NGX_OK;
 const NGX_ERROR = core.NGX_ERROR;
@@ -167,6 +168,12 @@ const wechatpay_request_context = extern struct {
     xpay_body: ngx_str_t,
     transport_complete: bool,
     chunked: http.ngx_http_chunked_t,
+    notify_in_read_call: bool,
+    notify_done: bool,
+    notify_verified: bool,
+    notify_status: ngx_int_t,
+    notify_body: ngx_str_t,
+    notify_challenge: ngx_str_t,
 };
 
 const wechatpay_loc_conf = extern struct {
@@ -190,6 +197,11 @@ const wechatpay_loc_conf = extern struct {
     oaep_decrypt: ngx_flag_t,
     allow_insecure_http: ngx_flag_t,
     body_max_size: usize,
+    notify_access: ngx_flag_t,
+    notify_appid: ngx_str_t,
+    notify_token: ngx_str_t,
+    notify_aes_key: ngx_str_t,
+    notify_key: ngx_str_t,
     ctx: [*c]wechatpay_context,
     ups: http.ngx_http_upstream_conf_t,
 };
@@ -274,6 +286,7 @@ fn wechatpay_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.oaep_decrypt = conf.NGX_CONF_UNSET;
         p.*.allow_insecure_http = conf.NGX_CONF_UNSET;
         p.*.body_max_size = conf.NGX_CONF_UNSET_SIZE;
+        p.*.notify_access = conf.NGX_CONF_UNSET;
         p.*.aes_secret = ngx.string.ngx_null_str;
         p.*.access_control = 0;
 
@@ -365,6 +378,27 @@ inline fn merge_loc(ch: [*c]wechatpay_loc_conf, pr: [*c]wechatpay_loc_conf) void
     }
 }
 
+fn merge_notify_loc(cf: [*c]ngx_conf_t, ch: [*c]wechatpay_loc_conf, pr: [*c]wechatpay_loc_conf) [*c]u8 {
+    conf.ngx_conf_merge_str_value(&ch.*.notify_appid, &pr.*.notify_appid, ngx_string(""));
+    conf.ngx_conf_merge_str_value(&ch.*.notify_token, &pr.*.notify_token, ngx_string(""));
+    conf.ngx_conf_merge_str_value(&ch.*.notify_aes_key, &pr.*.notify_aes_key, ngx_string(""));
+    if (ch.*.notify_access == conf.NGX_CONF_UNSET) ch.*.notify_access = if (pr.*.notify_access == conf.NGX_CONF_UNSET) 0 else pr.*.notify_access;
+    if (ch.*.notify_access == 1) {
+        config_assert(cf, ch.*.access_control == 0 and ch.*.proxy.len == 0 and ch.*.xpay_proxy.len == 0 and
+            ch.*.oaep_encrypt == conf.NGX_CONF_UNSET and ch.*.oaep_decrypt == conf.NGX_CONF_UNSET, "wechat_notify_access cannot be combined with wechatpay protocol handlers") catch return NGX_CONF_ERROR;
+        ch.*.notify_token = ngx_string(std.mem.trim(u8, str_slice(ch.*.notify_token), "\r\n"));
+        ch.*.notify_aes_key = ngx_string(std.mem.trim(u8, str_slice(ch.*.notify_aes_key), "\r\n"));
+        const key = notify.configurationKey(cf.*.pool, str_slice(ch.*.notify_appid), str_slice(ch.*.notify_token), str_slice(ch.*.notify_aes_key)) catch {
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_EMERG, cf.*.log, 0, "invalid wechat_notify AppID, Token or EncodingAESKey", .{});
+            return NGX_CONF_ERROR;
+        };
+        ch.*.notify_key = ngx_string(key);
+        const clcf = core.castPtr(http.ngx_http_core_loc_conf_t, conf.ngx_http_conf_get_module_loc_conf(cf, &ngx_http_core_module)) orelse return NGX_CONF_ERROR;
+        config_assert(cf, clcf.*.satisfy != 1, "wechat_notify_access requires satisfy all") catch return NGX_CONF_ERROR;
+    }
+    return conf.NGX_CONF_OK;
+}
+
 fn wechatpay_merge_loc_conf(
     cf: [*c]ngx_conf_t,
     parent: ?*anyopaque,
@@ -373,6 +407,7 @@ fn wechatpay_merge_loc_conf(
     if (core.castPtr(wechatpay_loc_conf, parent)) |pr| {
         if (core.castPtr(wechatpay_loc_conf, child)) |ch| {
             merge_loc(ch, pr);
+            if (merge_notify_loc(cf, ch, pr) != conf.NGX_CONF_OK) return NGX_CONF_ERROR;
             var hash = ngx.hash.ngx_hash_init_t{
                 .max_size = 100,
                 .bucket_size = 1024,
@@ -525,6 +560,18 @@ fn read_body(r: [*c]ngx_http_request_t) ngx_str_t {
     }
 
     return ngx_str_t{ .data = out, .len = offset };
+}
+
+// Use the existing API v3 chain construction pattern without changing its handler.
+fn replace_body(r: [*c]ngx_http_request_t, body: ngx_str_t) !void {
+    var chain = NChain.init(r.*.pool);
+    var out = ngx_chain_t{ .buf = null, .next = null };
+    const last = try chain.allocStr(body, &out);
+    last.*.buf.*.flags.last_buf = (r == r.*.main);
+    last.*.buf.*.flags.last_in_chain = true;
+    r.*.request_body.*.bufs = last;
+    r.*.request_body.*.buf = last.*.buf;
+    r.*.request_body.*.temp_file = null;
 }
 
 fn request_body_exceeds_limit(r: [*c]ngx_http_request_t, limit: usize) bool {
@@ -756,6 +803,7 @@ fn wechatpay_preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         v.*.get_handler = wechatpay_audit_variable;
         v.*.data = index;
     }
+    if (wechat_notify_variables(cf) != NGX_OK) return NGX_ERROR;
     ssl.SSL_LOG = cf.*.log;
     wechatpay_replay_zone = core.nullptr(core.ngx_shm_zone_t);
     return NGX_OK;
@@ -799,6 +847,10 @@ fn wechatpay_postconfiguration(
     );
     const h = access_handlers.append() catch return NGX_ERROR;
     h.* = ngx_http_wechatpay_access_handler;
+    const notify_preaccess = preaccess_handlers.append() catch return NGX_ERROR;
+    notify_preaccess.* = ngx_http_wechat_notify_preaccess_handler;
+    const notify_access = access_handlers.append() catch return NGX_ERROR;
+    notify_access.* = ngx_http_wechat_notify_access_handler;
 
     return NGX_OK;
 }
@@ -1485,6 +1537,157 @@ export fn ngx_http_wechatpay_access_handler(
     return NGX_DECLINED;
 }
 
+fn wechat_notify_variable(r: [*c]ngx_http_request_t, v: [*c]http.ngx_http_variable_value_t, data: core.uintptr_t) callconv(.c) ngx_int_t {
+    const ctx: [*c]wechatpay_request_context = core.castPtr(wechatpay_request_context, r.*.ctx[ngx_http_wechatpay_module.ctx_index]) orelse null;
+    const verified = ctx != null and ctx.*.notify_verified;
+    const value = switch (data) {
+        0 => if (verified) ctx.*.notify_body else ngx.string.ngx_null_str,
+        1 => if (verified) ngx_string("success") else ngx_string("unverified"),
+        else => if (verified) ctx.*.lccf.*.notify_appid else ngx.string.ngx_null_str,
+    };
+    v.*.data = value.data;
+    v.*.flags.len = @intCast(value.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn wechat_notify_variables(cf: [*c]ngx_conf_t) ngx_int_t {
+    for ([_][]const u8{ "wechat_notify_body", "wechat_notify_verification", "wechat_notify_appid" }, 0..) |name, index| {
+        var key = ngx_string(name);
+        const variable = http.ngx_http_add_variable(cf, &key, http.NGX_HTTP_VAR_NOCACHEABLE) orelse return NGX_ERROR;
+        variable.*.get_handler = wechat_notify_variable;
+        variable.*.data = index;
+    }
+    return NGX_OK;
+}
+
+fn ngx_http_wechat_notify_preaccess_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    const lc = core.castPtr(wechatpay_loc_conf, conf.ngx_http_get_module_loc_conf(r, &ngx_http_wechatpay_module)) orelse return NGX_DECLINED;
+    if (lc.*.notify_access != 1 or r == r.*.main) return NGX_DECLINED;
+    return http.NGX_HTTP_FORBIDDEN;
+}
+
+fn notify_header(r: [*c]ngx_http_request_t, existing: [*c]ngx_table_elt_t, key: ngx_str_t, lower: [*c]u8, value: ngx_str_t) ![*c]ngx_table_elt_t {
+    var headers = NList(ngx_table_elt_t).init0(&r.*.headers_in.headers);
+    const header = if (existing != null) existing else try headers.append();
+    header.* = std.mem.zeroes(ngx_table_elt_t);
+    header.*.hash = ngx.hash.ngx_hash_key_lc(lower, key.len);
+    header.*.key = key;
+    header.*.lowcase_key = lower;
+    header.*.value = value;
+    return header;
+}
+
+fn apply_notify_body(r: [*c]ngx_http_request_t, body: ngx_str_t) !void {
+    try replace_body(r, body);
+    const length = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, 24)) orelse return core.NError.OOM;
+    const length_text = try std.fmt.bufPrint(length[0..24], "{d}", .{body.len});
+    // Stock proxy_pass copies incoming headers even when hash is zero. Reuse
+    // the Transfer-Encoding slot as Content-Length so no stale wire framing
+    // remains in the header list, and keep the normal proxy suppression hash.
+    const length_header = if (r.*.headers_in.content_length != null) r.*.headers_in.content_length else r.*.headers_in.transfer_encoding;
+    r.*.headers_in.content_length = try notify_header(r, length_header, ngx_string("Content-Length"), @constCast("content-length"), ngx_string(length_text));
+    r.*.headers_in.content_length_n = @intCast(body.len);
+    r.*.headers_in.flags.chunked = false;
+    r.*.headers_in.transfer_encoding = null;
+    const trimmed = std.mem.trimStart(u8, str_slice(body), " \t\r\n");
+    const mime = if (trimmed.len > 0 and trimmed[0] == '<') ngx_string("application/xml") else ngx_string("application/json");
+    r.*.headers_in.content_type = try notify_header(r, r.*.headers_in.content_type, ngx_string("Content-Type"), @constCast("content-type"), mime);
+}
+
+fn verify_notify(r: [*c]ngx_http_request_t, ctx: [*c]wechatpay_request_context) !void {
+    const lc = ctx.*.lccf;
+    const stamp = try notify.argument(r, "timestamp");
+    const random = try notify.argument(r, "nonce");
+    if (r.*.method == http.NGX_HTTP_GET) {
+        try notify.verify(r.*.pool, str_slice(lc.*.notify_token), stamp, random, "", try notify.argument(r, "signature"));
+        ctx.*.notify_challenge = ngx_string(try notify.argument(r, "echostr"));
+    } else {
+        if (!std.mem.eql(u8, try notify.argument(r, "encrypt_type"), "aes")) return error.InvalidMessage;
+        const encrypted = try notify.encryptedBody(r.*.pool, str_slice(read_body(r)));
+        try notify.verify(r.*.pool, str_slice(lc.*.notify_token), stamp, random, encrypted, try notify.argument(r, "msg_signature"));
+        const body = ngx_string(try notify.decrypt(r.*.pool, str_slice(lc.*.notify_key), str_slice(lc.*.notify_appid), encrypted));
+        try apply_notify_body(r, body);
+        ctx.*.notify_body = body;
+    }
+    ctx.*.notify_verified = true;
+}
+
+fn send_notify_challenge(r: [*c]ngx_http_request_t, body: ngx_str_t) void {
+    var chain = NChain.init(r.*.pool);
+    var out = ngx_chain_t{ .buf = null, .next = null };
+    const last = chain.allocStr(body, &out) catch {
+        http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    last.*.buf.*.flags.last_buf = true;
+    last.*.buf.*.flags.last_in_chain = true;
+    r.*.headers_out.status = http.NGX_HTTP_OK;
+    r.*.headers_out.content_type = ngx_string("text/plain");
+    r.*.headers_out.content_length_n = @intCast(body.len);
+    const rc = http.ngx_http_send_header(r);
+    if (rc == NGX_ERROR or rc > NGX_OK) {
+        http.ngx_http_finalize_request(r, rc);
+        return;
+    }
+    http.ngx_http_finalize_request(r, http.ngx_http_output_filter(r, last));
+}
+
+export fn ngx_http_wechat_notify_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
+    const ctx = core.castPtr(wechatpay_request_context, r.*.ctx[ngx_http_wechatpay_module.ctx_index]) orelse {
+        http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    ctx.*.notify_status = NGX_DECLINED;
+    if (request_body_exceeds_limit(r, ctx.*.lccf.*.body_max_size)) {
+        ctx.*.notify_status = NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    } else {
+        verify_notify(r, ctx) catch |err| {
+            ctx.*.notify_status = if (err == core.NError.OOM) NGX_HTTP_INTERNAL_SERVER_ERROR else http.NGX_HTTP_FORBIDDEN;
+        };
+    }
+    ctx.*.notify_done = true;
+    // An immediate callback must leave phase progression to the outer walker.
+    if (ctx.*.notify_in_read_call) return;
+    if (ctx.*.notify_status != NGX_DECLINED) {
+        http.ngx_http_finalize_request(r, ctx.*.notify_status);
+    } else if (r.*.method == http.NGX_HTTP_GET) {
+        send_notify_challenge(r, ctx.*.notify_challenge);
+    } else {
+        r.*.write_event_handler = http.ngx_http_core_run_phases;
+        http.ngx_http_core_run_phases(r);
+    }
+}
+
+export fn ngx_http_wechat_notify_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    const lc = core.castPtr(wechatpay_loc_conf, conf.ngx_http_get_module_loc_conf(r, &ngx_http_wechatpay_module)) orelse return NGX_DECLINED;
+    if (lc.*.notify_access != 1) return NGX_DECLINED;
+    if (r != r.*.main) return http.NGX_HTTP_FORBIDDEN;
+    if (r.*.method != http.NGX_HTTP_GET and r.*.method != http.NGX_HTTP_POST) return http.NGX_HTTP_NOT_ALLOWED;
+    const ctx = http.ngz_http_get_module_ctx(wechatpay_request_context, r, &ngx_http_wechatpay_module) catch return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    if (ctx.*.notify_done) return ctx.*.notify_status;
+    ctx.*.lccf = lc;
+    if (request_body_exceeds_limit(r, lc.*.body_max_size)) return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    ctx.*.notify_in_read_call = true;
+    const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechat_notify_body_handler);
+    ctx.*.notify_in_read_call = false;
+    if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
+    // Balance exactly the hold taken by read_client_request_body, before any
+    // synchronous content handler can finalize the request.
+    http.ngx_http_finalize_request(r, core.NGX_DONE);
+    if (ctx.*.notify_done) {
+        if (ctx.*.notify_status != NGX_DECLINED) return ctx.*.notify_status;
+        if (r.*.method == http.NGX_HTTP_GET) {
+            send_notify_challenge(r, ctx.*.notify_challenge);
+            return core.NGX_DONE;
+        }
+        return NGX_DECLINED;
+    }
+    return core.NGX_DONE;
+}
+
 //////////////////////////     OAEP HANDLER   //////////////////////////////////////////////////////
 
 fn execute_oaep_action(
@@ -1573,6 +1776,38 @@ export const ngx_http_wechatpay_module_ctx = ngx_http_module_t{
 
 const CONF_PHASES = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF;
 export const ngx_http_wechatpay_commands = [_]ngx_command_t{
+    ngx_command_t{
+        .name = ngx_string("wechat_notify_access"),
+        .type = CONF_PHASES | conf.NGX_CONF_FLAG,
+        .set = conf.ngx_conf_set_flag_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "notify_access"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechat_notify_appid"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "notify_appid"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechat_notify_token_file"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_file_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "notify_token"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechat_notify_aes_key_file"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_file_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "notify_aes_key"),
+        .post = null,
+    },
     ngx_command_t{
         .name = ngx_string("wechatpay_xpay_proxy_pass"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,

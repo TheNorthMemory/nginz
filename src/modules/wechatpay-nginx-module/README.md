@@ -243,6 +243,94 @@ request body, decrypts and appends plaintxt for the location's content handler, 
 
 [1]: https://pay.weixin.qq.com/ "wechat pay"
 
+### WeChat message-push verification and decryption
+
+The `wechat_notify_*` directives add the Mini Program/WeChat message-push
+Token/SHA-1/AES-256-CBC protocol to this module. This is separate from API v3's
+RSA/AES-GCM protocol and XPay upstream signing. Existing directives, including
+API v3's JSON `plaintxt` field and `$wechatpay_notification`, retain their behavior.
+
+```nginx
+server {
+    wechat_notify_appid wx0123456789abcdef;
+    wechat_notify_token_file /run/app/message-token;
+    wechat_notify_aes_key_file /run/app/message-aes-key;
+
+    location = /notify {
+        wechat_notify_access on;
+        wechatpay_body_max_size 64k;
+        client_max_body_size 64k;
+        client_body_buffer_size 64k;
+        js_content app.notification;
+        # Or use echozn "success" / echoz_request_body / proxy_pass.
+    }
+}
+```
+
+| Directive | Context | Behavior |
+| --- | --- | --- |
+| `wechat_notify_access on\|off` | http/server/location | Inherited access gate; defaults to off |
+| `wechat_notify_appid value` | http/server/location | Expected AppID in the decrypted envelope; required when enabled |
+| `wechat_notify_token_file path` | http/server/location | Read the message Token through the existing native file-slot loader |
+| `wechat_notify_aes_key_file path` | http/server/location | Read the 43-character EncodingAESKey through the same loader |
+
+Credential files are read at configuration load/reload, relative to the nginx
+configuration directory or by absolute path. Trailing CR/LF is accepted. Missing
+or invalid credentials fail configuration. All directives inherit independently;
+a child location may disable the gate with `wechat_notify_access off`.
+`wechatpay_body_max_size` supplies the existing module body bound (default 1 MiB).
+Keep `client_max_body_size` at the same bound to limit bodies during acquisition.
+
+GET verifies `signature` over the sorted Token, timestamp and nonce, then returns
+the URL-decoded `echostr` as `200 text/plain` without invoking content. POST
+requires `encrypt_type=aes`, extracts `Encrypt` from a strict JSON object or XML
+`xml` envelope, verifies `msg_signature`, decrypts using OpenSSL, and checks all
+padding bytes, the embedded message length and the trailing AppID. JSON duplicate
+keys, duplicate security query arguments, duplicate XML `Encrypt` elements,
+XML DTD/entity declarations and malformed ciphertext are rejected. XML parsing
+disables network access and does not enable DTD loading or entity substitution.
+Plaintext/compatibility-mode POST and encrypted GET challenges are not supported.
+
+After successful POST verification, the normal request body is the exact inner
+JSON/XML bytes. The handler updates Content-Length/Content-Type and removes
+encrypted-body transfer framing. It does not convert XML to JSON, interpret
+business events, call a provider or acknowledge POST on the application's behalf.
+Echo, njs and proxy content handlers decide the response. GET/POST are the only
+accepted methods; failures return 403, unsupported methods 405, oversized bodies
+413, and allocation failures 500. Requests to protected locations must be main
+requests; subrequest targets are rejected before access. Use `satisfy all`.
+
+The native variables are read-only and request-local:
+
+| Variable | Value |
+| --- | --- |
+| `$wechat_notify_body` | Verified inner POST plaintext; empty before verification |
+| `$wechat_notify_verification` | `success` after verification, otherwise `unverified` |
+| `$wechat_notify_appid` | Configured AppID after verification; empty before verification |
+
+An njs content handler can use `await r.readRequestJSON()` for JSON or
+`await r.readRequestText()` for XML. If an earlier njs access handler has already
+cached the encrypted body, use `$wechat_notify_body` as the authenticated source;
+the gate does not change njs's existing cache implementation. Do not use
+`return 200` for the protected responder: rewrite-phase `return` precedes access.
+Use a content-phase handler such as `echozn`.
+
+Timestamp and nonce are required and covered by the signature; timestamp must be
+decimal. The gate imposes no age/replay window, allowing provider retries with
+the same signed envelope. The application remains responsible for idempotent
+business processing and acknowledging only completed work.
+
+Validation: `ZIG_OPTIMIZE=ReleaseSmall bun test tests/wechat-notify/ tests/wechatpay/ tests/xpay/`.
+The new suite covers JSON/XML, all padding lengths, application isolation,
+decryption failures, GET challenges, split/chunked/100-continue requests,
+file-backed bodies, native bounds, inherited disabling, subrequest rejection,
+echo/njs/proxy consumers, and repeated synchronous echo requests on keepalive.
+
+The [native/njs comparison](../../../perf/wechat-notify/README.md) holds the njs
+content handler constant and reports throughput and latency across payload sizes
+and concurrency levels. Run the opt-in comparison test with
+`WECHAT_NOTIFY_BENCHMARK=1 ZIG_OPTIMIZE=ReleaseSmall bun test tests/wechat-notify/benchmark.test.js`.
+
 ### Documentation Audit Checklist
 
 - [x] Audit date: 2026-04-10

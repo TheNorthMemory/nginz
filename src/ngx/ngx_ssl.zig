@@ -227,6 +227,33 @@ pub const EVP_MD = ngx.EVP_MD;
 
 extern fn EVP_Digest(data: ?*const anyopaque, count: usize, md: [*c]u8, size: *c_uint, kind: ?*const EVP_MD, impl: ?*ngx.ENGINE) c_int;
 extern fn CRYPTO_memcmp(a: *const anyopaque, b: *const anyopaque, len: usize) c_int;
+extern fn EVP_sha1() ?*const EVP_MD;
+extern fn EVP_aes_256_cbc() ?*const ngx.EVP_CIPHER;
+
+pub fn sha1(input: []const u8) ![20]u8 {
+    var digest: [20]u8 = undefined;
+    var len: c_uint = 0;
+    if (EVP_Digest(input.ptr, input.len, &digest, &len, EVP_sha1(), null) != 1 or len != digest.len)
+        return core.NError.SSL_ERROR;
+    return digest;
+}
+
+/// Protocols with nonstandard padding must validate it after decryption.
+pub fn aes256CbcDecrypt(pool: [*c]ngx_pool_t, key: []const u8, ciphertext: []const u8) ![]u8 {
+    if (key.len != 32 or ciphertext.len == 0 or ciphertext.len % 16 != 0 or ciphertext.len > std.math.maxInt(c_int))
+        return core.NError.SSL_ERROR;
+    const ctx = EVP_CIPHER_CTX_new() orelse return core.NError.SSL_ERROR;
+    defer EVP_CIPHER_CTX_free(ctx);
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), null, key.ptr, key.ptr) != 1 or
+        EVP_CIPHER_CTX_set_padding(ctx, 0) != 1) return core.NError.SSL_ERROR;
+    const output = core.castPtr(u8, core.ngx_pnalloc(pool, ciphertext.len + 16)) orelse return core.NError.OOM;
+    var length: c_int = 0;
+    var tail: c_int = 0;
+    if (EVP_DecryptUpdate(ctx, output, &length, ciphertext.ptr, @intCast(ciphertext.len)) != 1 or length < 0 or
+        EVP_DecryptFinal_ex(ctx, output + @as(usize, @intCast(length)), &tail) != 1 or tail < 0 or
+        @as(usize, @intCast(length)) + @as(usize, @intCast(tail)) != ciphertext.len) return core.NError.SSL_ERROR;
+    return output[0..ciphertext.len];
+}
 
 pub fn sha256(input: []const u8) ![32]u8 {
     var digest: [32]u8 = undefined;
