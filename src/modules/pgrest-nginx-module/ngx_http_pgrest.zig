@@ -106,6 +106,7 @@ const ngx_pgrest_loc_conf_t = extern struct {
     timeout: ngx_msec_t, // connect/query socket timeout
     pool_acquisition_timeout: ngx_msec_t,
     pool_queue_size: ngx_int_t,
+    pool_fallback: ngx_str_t, // literal named location, or "off"; acquisition failures only
 
     // JWT role-based access control
     jwt_secret: ngx_str_t,
@@ -256,6 +257,7 @@ const PgRequestCtx = extern struct {
     wait_previous: ?*PgRequestCtx,
     wait_next: ?*PgRequestCtx,
     wait_event: ngx_event_t,
+    spilled_request: ?*ngx_http_request_t, // survives named-location module-context reset via HTTP cleanup
     cleanup_registered: bool,
     pool_conn: ?*PgPoolConn, // Assigned connection from pool
     query_state: PgQueryState, // Current query execution state
@@ -361,7 +363,7 @@ fn trace_pool_event(ctx: *PgRequestCtx, pool_conn: ?*PgPoolConn, event_name: []c
     const slot: usize = if (pool_conn) |pc| pool_slot_index(pc) else 9999;
     const fd: c_int = if (pool_conn) |pc| pc.fd else -1;
     const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
-    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz", .{ ctx.*.trace_req_seq, slot, fd, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
+    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz", .{ ctx.*.trace_req_seq, slot, fd, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
 }
 
 fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
@@ -373,7 +375,7 @@ fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
     const age = ngx_current_msec - ctx.*.trace_started_msec;
     const stalled = ngx_current_msec - ctx.*.trace_last_progress_msec;
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout req=%uz slot=%uz fd=%d age=%M stalled=%M", .{ ctx.*.trace_req_seq, slot, fd, age, stalled });
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d", .{ ctx.*.trace_req_seq, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d", .{ ctx.*.trace_req_seq, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state });
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-stats req=%uz qseq=%uz flush=%d poll=%d rcalls=%uz wcalls=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_query_seq, ctx.*.trace_last_flush_result, ctx.*.trace_last_poll_status, ctx.*.trace_read_calls, ctx.*.trace_write_calls });
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-end req=%uz finals=%uz releases=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_finalize_calls, ctx.*.trace_release_calls });
 }
@@ -2260,8 +2262,22 @@ fn wrap_counted_query(ctx: *PgRequestCtx) bool {
     return set_active_query(ctx, wrapped[0..pos]);
 }
 
+fn request_has_spilled(r: [*c]ngx_http_request_t) bool {
+    // A named location clears r->ctx. Keep the once-only marker in our HTTP
+    // cleanup node instead, scoped to this request (not its parent/siblings).
+    var cleanup_node = r.*.main.*.cleanup;
+    while (cleanup_node != null) : (cleanup_node = cleanup_node.*.next) {
+        if (cleanup_node.*.handler == pooled_request_cleanup) {
+            const previous = core.castPtr(PgRequestCtx, cleanup_node.*.data) orelse continue;
+            if (previous.*.spilled_request == r) return true;
+        }
+    }
+    return false;
+}
+
 fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ngx_int_t {
     const r = ctx.*.request.?;
+    if (request_has_spilled(r)) return pool_acquisition_error(r);
     if (!ctx.*.cleanup_registered) {
         // Request holds alone do not protect callbacks during forced nginx
         // termination: core runs HTTP cleanups, then resets main->count to 1.
@@ -2457,11 +2473,27 @@ fn pool_acquisition_error(r: [*c]ngx_http_request_t) ngx_int_t {
     return send_protocol_error(r, 504, "PGRST003", "Timed out acquiring connection from connection pool.", null, null);
 }
 
+fn pool_acquisition_failed(ctx: *PgRequestCtx, lc: *ngx_pgrest_loc_conf_t) ngx_int_t {
+    const r = ctx.*.request.?;
+    if (lc.*.pool_fallback.len < 2 or lc.*.pool_fallback.data[0] != '@') return pool_acquisition_error(r);
+    // Only callers which never acquired a connection may enter here. Do not
+    // reuse this path for connection, SQL, commit or response failures.
+    if (ctx.*.pool_conn != null or r.*.flags1.header_sent) return pool_acquisition_error(r);
+    trace_pool_event(ctx, null, "pool-spill");
+    ctx.*.spilled_request = r;
+    ctx.*.request = null;
+    release_pooled_ctx(ctx, false);
+    // release_pooled_ctx retains the subrequest completion hold. nginx still
+    // consumes it after the target completes and wakes its parent, including
+    // SSI/auth_request parents. Dropping it here undercounts those parents.
+    return http.ngx_http_named_location(r, &lc.*.pool_fallback);
+}
+
 fn enqueue_pool_waiter(ctx: *PgRequestCtx, pool: *PgConnPool, lc: *ngx_pgrest_loc_conf_t) ngx_int_t {
     const limit: usize = @intCast(@max(lc.*.pool_queue_size, 0));
     if (pool.wait_count >= limit or lc.*.pool_acquisition_timeout == 0) {
         trace_pool_event(ctx, null, "queue-full");
-        return pool_acquisition_error(ctx.*.request.?);
+        return pool_acquisition_failed(ctx, lc);
     }
     ctx.*.wait_pool = pool;
     ctx.*.wait_previous = pool.wait_tail;
@@ -2488,9 +2520,11 @@ fn pool_wait_handler(ev: [*c]ngx_event_t) callconv(.c) void {
     trace_pool_event(ctx, null, if (expired) "queue-expired" else "queue-wake");
     unlink_pool_waiter(ctx);
     const lc = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module)).?;
-    const rc = if (expired) pool_acquisition_error(r) else if (r.*.connection.*.flags.@"error") core.NGX_ERROR else start_pooled_request(ctx, lc);
+    const rc = if (r.*.connection.*.flags.@"error") core.NGX_ERROR else if (expired) pool_acquisition_failed(ctx, lc) else start_pooled_request(ctx, lc);
     wake_pool_waiter(pool);
-    if (rc == core.NGX_DONE) return;
+    // NGX_DONE from a new native operation keeps our callback alive; NGX_DONE
+    // from named_location instead needs this caller's normal finalize balance.
+    if (rc == core.NGX_DONE and ctx.*.spilled_request == null) return;
     ctx.*.request = null;
     release_pooled_ctx(ctx, true);
     const connection = r.*.connection;
@@ -3059,6 +3093,16 @@ fn pgrest_merge_loc_conf(
     if (cur.*.pool_acquisition_timeout == conf.NGX_CONF_UNSET_MSEC) cur.*.pool_acquisition_timeout = if (prev.*.pool_acquisition_timeout == conf.NGX_CONF_UNSET_MSEC) 10000 else prev.*.pool_acquisition_timeout;
     if (cur.*.pool_queue_size == NGX_CONF_UNSET) cur.*.pool_queue_size = if (prev.*.pool_queue_size == NGX_CONF_UNSET) 128 else prev.*.pool_queue_size;
     if (cur.*.pool_queue_size < 0 or cur.*.pool_queue_size > 4096) return core.c_str("pgrest_pool_queue_size must be between 0 and 4096");
+    if (cur.*.pool_fallback.len == 0) cur.*.pool_fallback = prev.*.pool_fallback;
+    if (cur.*.pool_fallback.len > 0) {
+        const target = core.slicify(u8, cur.*.pool_fallback.data, cur.*.pool_fallback.len);
+        if (!std.mem.eql(u8, target, "off")) {
+            if (target.len < 2 or target[0] != '@') return core.c_str("pgrest_pool_fallback requires a literal named location or off");
+            for (target[1..]) |ch| {
+                if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return core.c_str("pgrest_pool_fallback requires a literal named location or off");
+            }
+        }
+    }
     if (cur.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) cur.*.json_scalar_max_size =
         if (prev.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) MAX_JSON_SIZE else prev.*.json_scalar_max_size;
     if (cur.*.json_scalar_max_size < MIN_RESPONSE_BUFFER_SIZE or cur.*.json_scalar_max_size > MAX_JSON_SCALAR_SIZE) {
@@ -8775,7 +8819,9 @@ fn parse_rpc_body_params(
 
 export fn ngx_http_pgrest_upstream_client_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     const rc = ngx_http_pgrest_upstream_handler(r);
-    if (rc != core.NGX_DONE) {
+    // Immediate overflow can redirect inside this body callback. Unlike an
+    // ongoing native operation, named_location adds its own request hold.
+    if (rc != core.NGX_DONE or request_has_spilled(r)) {
         http.ngx_http_finalize_request(r, rc);
     }
 }
@@ -10198,6 +10244,14 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_num_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(ngx_pgrest_loc_conf_t, "pool_queue_size"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("pgrest_pool_fallback"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "pool_fallback"),
         .post = null,
     },
     ngx_command_t{

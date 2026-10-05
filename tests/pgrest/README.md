@@ -9,7 +9,8 @@ bun test tests/pgrest
 The standard preload builds the local nginz binary. No sibling application
 checkout, application credentials, saved settings or app container is needed.
 The suite includes mock wire-protocol tests, PostgreSQL integration/security/
-serialization tests and nine acquisition-queue tests. All run by default.
+serialization tests, nine acquisition-queue tests and twelve delayed-spill
+tests against PostgREST 16.4. All run by default.
 
 ## Prerequisites
 
@@ -21,6 +22,11 @@ serialization tests and nine acquisition-queue tests. All run by default.
   access via `docker exec ... psql -U postgres`. PostgreSQL 18 is the tested
   version. Retain the fixture and its volume between runs; start it if stopped.
 - `nc`, used by the existing PostgreSQL integration readiness check.
+- The locally pulled `postgrest/postgrest:v16.4` image and `tar`. The spill suite
+  extracts that image's static binary and runs it inside the existing PostgreSQL
+  fixture, using a private temporary directory in its named `pg18` volume.
+  No additional container, application checkout or supervisor is required.
+  The existing fixture uses host networking for loopback access.
 
 Missing infrastructure fails the suite explicitly. There is no opt-in or silent
 skip for real-database or queue tests. Fixture SQL creates disposable users and
@@ -58,3 +64,16 @@ The soak guards gross leaks/stalls with a stable worker, one database slot,
 at most 16 MiB RSS growth after warm-up, at most two additional descriptors and
 p99 below two seconds. It is bounded regression coverage, not a throughput
 benchmark or long-duration production qualification.
+
+## Delayed spill coverage
+
+`pgrest.spill.container.test.js` runs twelve cases covering native preference,
+the acquisition deadline, full/disabled queues, rewritten requests and bodies,
+JWT isolation, methods and response headers, committed-write errors, backup
+failure/exhaustion, redirect loops, parent/subrequest lifetimes, cancellation,
+HTTP/2, twenty deadline races and graceful reload. HTTP calls are not retried.
+SQL effects prove writes execute once; worker logs must contain no lifetime or
+open-socket alerts. Reports live under `$XDG_STATE_HOME/nginz/tests/pgrest-spill/`
+(default `~/.local/state/nginz/tests/pgrest-spill/`). Cleanup terminates only the
+fixture's own PostgREST process and removes its own database, role and temporary
+volume directory. The existing container and named volume are retained.

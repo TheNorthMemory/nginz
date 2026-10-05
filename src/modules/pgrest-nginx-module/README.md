@@ -1348,11 +1348,60 @@ Error responses:
 | `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `on` | PostgREST scalar/SETOF JSON shapes using PostgreSQL type-aware serialization. `off` retains the legacy scalar row wrapper and is not the compatibility profile. |
 | `pgrest_pool_acquisition_timeout` | `pgrest_pool_acquisition_timeout 10s` | `location` | `10s` | Maximum queue wait, separate from database I/O. Expiry returns HTTP 504/PGRST003 before SQL is submitted. |
 | `pgrest_pool_queue_size` | `pgrest_pool_queue_size 128` | `location` | `128` | Waiter admission cap (0–4096) against the shared worker-local DSN/size queue. Use consistent caps across locations sharing a pool. Full/disabled queues return 504/PGRST003 immediately. |
+| `pgrest_pool_fallback` | `pgrest_pool_fallback @backup` or `off` | `location` | `off` | Transfer an unexecuted request to a literal named location when acquisition expires or queue admission fails. Never applies to database connection, query, commit or response errors. Inherited; `off` overrides inheritance. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
 | `pgrest_jwt_secret` | `pgrest_jwt_secret "secret"` | `location` | — | HS256 secret for JWT signature validation. When set, tokens are validated before role extraction. |
 | `pgrest_anon_role` | `pgrest_anon_role "role"` | `location` | — | PostgreSQL role to use when no valid JWT is provided. |
 | `pgrest_jwt_role_claim` | `pgrest_jwt_role_claim "claim"` | `location` | `role` | JWT claim name that contains the PostgreSQL role. |
+
+### Optional delayed acquisition spill
+
+```nginx
+location /api/ {
+    # Keep the application's native JWT guard here.
+    rewrite ^/api(/.*)$ $1 break;
+    pgrest_pass "host=pg dbname=example user=authenticator password=...";
+    pgrest_schemas api;
+    pgrest_pool_size 6;
+    pgrest_pool_acquisition_timeout 30ms;
+    pgrest_pool_queue_size 128;
+    pgrest_pool_fallback @postgrest;
+}
+location @postgrest {
+    internal;
+    # Apply equivalent authentication, fixed schemas and identity in PostgREST.
+    proxy_pass http://postgrest:3000;
+    proxy_next_upstream off;
+    proxy_intercept_errors off;
+}
+```
+
+The existing acquisition timeout is the delay: a slot becoming free first keeps
+the request native. A full/disabled queue or a zero timeout spills immediately.
+With fallback off, these conditions still return 504/PGRST003. The 30 ms example
+is an initial tuning value, not a measured optimum or a database execution limit.
+
+Handoff is entirely native and preserves the current rewritten URI, arguments,
+method, buffered body and request headers. Queue timers/events are unlinked and
+request holds are balanced before handing execution to nginx's named-location
+machinery. A marker in the request cleanup list survives internal redirects;
+reentry into pgrest cannot execute SQL or spill again on that same request.
+Subrequests have independent markers. Client cancellation before handoff removes
+the waiter. A named target must not configure further HTTP error retries.
+
+Only acquisition failure can spill. Never replace this with generic 5xx
+`error_page` routing: a response error can follow a committed write. Missing
+targets or an unavailable/full backup return an error; they never replay SQL on
+the original pool. PostgREST owns a separate connection pool, which must be
+included in the total PostgreSQL budget and request deadline.
+
+`bun test tests/pgrest` includes real PostgREST 16.4 spill regressions: delay and
+native preference, GET/HEAD/POST/PATCH/DELETE preservation, disk-buffered bodies,
+JWT isolation, no spill after SQL/commit failures, once-only handoff, unavailable
+or exhausted backup, njs/SSI/auth subrequests, HTTP/2 reset, queued cancellation,
+release/deadline races and graceful reload. These are local regression results,
+not a production throughput claim.
 
 ### Shared-container budgeting and stress regression
 
