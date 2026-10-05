@@ -1,10 +1,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { createPostgresMock } from "../pgrest/mock.js";
 import {
   startNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
-  createPostgresMock,
   MOCK_PORTS,
   teardownModule,
   prepareMockPorts,
@@ -39,26 +39,27 @@ function setupPgMock() {
     rows: [],
   }));
 
-  // Handle introspection queries (pg_constraint, pg_class, etc.) with empty results
+  pgMock.setQueryHandler(/SELECT p\.provolatile.*p\.proname\s*=\s*'add_them'/, () => ({
+    columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+    rows: [["i", "f", "f", "f", "0", "", "", "a,b", "0", '{"a":"integer","b":"integer"}', "f", "a => integer, b => integer"]],
+  }));
+
+  // Handle unrelated introspection queries with empty results.
   pgMock.setQueryHandler(/pg_constraint|pg_class|pg_attribute|pg_namespace|pg_type|information_schema/i, () => ({
     columns: ["dummy"],
     rows: [],
   }));
 
   pgMock.setQueryHandler(/add_them/i, () => ({
-    columns: ["add_them"],
-    rows: [["3"]],
+    columns: [{ name: "add_them", typeOid: 23 }],
+    rows: [[3]],
   }));
 
   return pgMock;
 }
 
-// Split into separate nginx lifecycles. A single long chain that mixes
-// FILTER + CREATE + RPC + PATCH + DELETE has been observed to hang the
-// next njs→pgrest subrequest (client sees ECONNRESET / timeout; mock never
-// receives the query). Isolating read/RPC from writes keeps each suite
-// short and avoids that sequence.
-describe("njs pgrest subrequest reads and rpc", () => {
+// Keep reads, writes and RPC in one lifecycle to detect sequence regressions.
+describe("njs pgrest subrequests", () => {
   let pgMock;
 
   beforeAll(async () => {
@@ -90,35 +91,19 @@ describe("njs pgrest subrequest reads and rpc", () => {
     expect(body[0]).toHaveProperty("name");
   });
 
-  test("subrequest RPC calls a function", async () => {
-    const res = await testFetch(`/njs/pgrest/rpc?fn=add_them&a=1&b=2`, { method: "POST" });
-    expect(res.status === 200 || res.status === 201).toBe(true);
-    const body = await res.json();
-    // RPC result could be scalar or object
-    expect(body).toBeTruthy();
-  });
-});
-
-describe("njs pgrest subrequest writes", () => {
-  let pgMock;
-
-  beforeAll(async () => {
-    await prepareMockPorts(MOCK_PORTS.POSTGRES);
-    pgMock = setupPgMock();
-    await startNginz("tests/njs/pgrest-subrequest.conf", MODULE);
-  }, 30000);
-
-  afterAll(async () => {
-    await teardownModule(MODULE, [pgMock], [MOCK_PORTS.POSTGRES]);
-  });
-
   test("subrequest POST /api/users creates a user", async () => {
     const res = await testFetch(`/njs/pgrest/users-create`, {
       method: "POST",
       body: JSON.stringify({ name: "Dave", email: "dave@test.com" }),
     });
     // pgrest returns 201 on successful POST
-    expect(res.status === 201 || res.status === 200).toBe(true);
+    expect(res.status).toBe(201);
+  });
+
+  test("subrequest RPC calls a function", async () => {
+    const res = await testFetch(`/njs/pgrest/rpc?fn=add_them&a=1&b=2`, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toBe(3);
   });
 
   test("subrequest PATCH /api/users updates a user", async () => {
@@ -126,13 +111,13 @@ describe("njs pgrest subrequest writes", () => {
       method: "POST",
       body: JSON.stringify({ name: "Alice-Updated" }),
     });
-    expect(res.status === 200 || res.status === 204).toBe(true);
+    expect(res.status).toBe(204);
   });
 
   test("subrequest DELETE /api/users removes a user", async () => {
     const res = await testFetch(`/njs/pgrest/users-delete?id=3`, {
       method: "POST",
     });
-    expect(res.status === 200 || res.status === 204).toBe(true);
+    expect(res.status).toBe(204);
   });
 });

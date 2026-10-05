@@ -92,6 +92,24 @@ at most 16 MiB RSS growth after warm-up, at most two additional descriptors and
 p99 below two seconds. It is bounded regression coverage, not a throughput
 benchmark or long-duration production qualification.
 
+## Subrequest coverage
+
+`pgrest.subrequest.container.test.js` uses the same optional PostgreSQL fixture,
+an isolated database/role and its own nginz process on an ephemeral port. Seven
+cases cover repeated CRUD/RPC in one njs parent on a keep-alive connection,
+parallel siblings and transaction-local request context, SQL and committed
+response-setting errors followed by recovery, HEAD success/error statuses,
+SSI and auth bodies, background mirrors and detached njs writes. Background
+writes must complete exactly once even when the client closes after receiving
+the parent response. Worker logs are checked for lifetime and header alerts.
+
+No PostgREST image is required for these cases. Missing PostgreSQL prerequisites
+produce explicit skips; setup/assertion errors with available prerequisites
+fail. Cleanup stops only this run's process and drops its database and role.
+Configurations and logs remain private under
+`$XDG_STATE_HOME/nginz/tests/pgrest-subrequest/<run>/` (default
+`~/.local/state/nginz/tests/pgrest-subrequest/`).
+
 ## Delayed spill coverage
 
 `pgrest.spill.container.test.js` runs twelve cases covering native preference,

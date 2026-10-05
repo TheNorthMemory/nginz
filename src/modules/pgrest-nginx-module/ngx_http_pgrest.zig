@@ -2291,7 +2291,10 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         // (e.g. upstream/body processing), but replace the default no-op.
         r.*.read_event_handler = http.ngx_http_test_reading;
         const main = r.*.main;
-        if (main.*.read_event_handler == http.ngx_http_block_reading and
+        // A mirror may start after the parent has finished its response. Keep
+        // nginx's completion read handler then: EOF is a normal client close,
+        // not an abort that should terminate the outstanding background SQL.
+        if (!main.*.flags1.done and main.*.read_event_handler == http.ngx_http_block_reading and
             !main.*.flags1.reading_body and !main.*.flags1.discard_body)
         {
             main.*.read_event_handler = http.ngx_http_test_reading;
@@ -8983,13 +8986,9 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         return core.NGX_DONE;
     }
 
-    // Mirror module creates background subrequests with header_only=1.
-    // Only skip when BOTH are set: mirror fires these as side-effects and
-    // discards the response.  njs also creates background subrequests but
-    // without header_only — those need pgrest to process normally.
-    if (r.*.flags1.header_only and r.*.flags1.background) {
-        return core.NGX_OK;
-    }
+    // header_only controls response output, not whether SQL executes. nginx
+    // marks mirror requests and njs HEAD subrequests as background/header_only;
+    // both still need a transaction and status before normal finalization.
 
     // Get location config to retrieve connection string
     const loc_conf = core.castPtr(
@@ -10091,8 +10090,7 @@ fn send_committed_response(ctx: *PgRequestCtx, opts: RequestOptions) void {
     ctx.*.request = null;
     release_pooled_ctx(ctx, false);
 
-    // header_only subrequests (auth_request: header_only=1, background=0; mirror
-    // is already caught at handler entry by the background guard there).
+    // header_only subrequests (auth_request, mirror and njs HEAD).
     // auth_request reads headers_out.status, so we still need to send headers —
     // but must NOT output the body, which would leak into the parent's postponed
     // output chain and corrupt the response.

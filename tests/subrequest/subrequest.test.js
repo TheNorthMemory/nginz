@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { createPostgresMock } from "../pgrest/mock.js";
 import { readFileSync } from "fs";
 import { join } from "path";
 import {
@@ -7,7 +8,6 @@ import {
   prepareMockPorts,
   testFetch,
   createRedisMock,
-  createPostgresMock,
   createConsulMock,
   createHTTPMock,
   MOCK_PORTS,

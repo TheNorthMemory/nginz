@@ -1,10 +1,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { createPostgresMock } from "../pgrest/mock.js";
 import {
   startNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
-  createPostgresMock,
   MOCK_PORTS,
   teardownModule,
   prepareMockPorts,

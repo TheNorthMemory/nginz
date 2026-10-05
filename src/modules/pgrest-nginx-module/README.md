@@ -86,6 +86,32 @@ location /api/ {
 }
 ```
 
+### Subrequest targets
+
+pgrest executes database requests from njs, SSI, `auth_request` and `mirror`.
+Header-only requests still execute SQL and return their status; their response
+body is suppressed. This includes njs HEAD calls and detached/background calls.
+Once the parent response has completed, a normal client close does not cancel
+its outstanding background transaction. Disconnecting while the parent is
+still waiting retains the normal cancellation and rollback behavior.
+
+Strip a location prefix before pgrest handles RPC paths, including internal
+subrequest targets. The handler recognizes `/rpc/function`, so a URI such as
+`/_pgrest/rpc/function` needs the same rewrite as a public prefixed API:
+
+```nginx
+location /_pgrest/ {
+    internal;
+    rewrite ^/_pgrest/(.*)$ /$1 break;
+    pgrest_pass "host=localhost dbname=mydb user=authenticator password=secret";
+    pgrest_schemas public;
+}
+```
+
+Run `bun test tests/pgrest tests/njs tests/subrequest` for the native PostgreSQL
+subrequest regressions and mock caller suites. See the
+[test prerequisites and coverage](../../../tests/pgrest/README.md#subrequest-coverage).
+
 ## JWT Authentication
 
 pgrest supports JWT authentication that integrates directly with PostgreSQL. The JWT token is passed to PostgreSQL via the `request.jwt` claim, allowing your database functions to enforce authorization and access control.
