@@ -2,10 +2,11 @@
 // test container. No application checkout, configuration or nginx image is used.
 import { beforeAll, afterAll, afterEach, describe, test } from 'bun:test';
 import { dockerCommand } from '../docker.js';
+import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect, constants } from 'node:http2';
 import { createServer } from 'node:net';
@@ -13,7 +14,8 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-const pg = 'pgrest-nginz-test';
+const fixture=await postgresFixture(); explainSkip('queue',fixture);
+const hasProc=process.platform==='linux'&&existsSync(`/proc/${process.pid}/fd`);
 const state = resolve(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'nginz/tests/pgrest-queue');
 const id = 'queue_' + randomBytes(6).toString('hex'), password = randomBytes(24).toString('hex');
 const evidence = join(state, new Date().toISOString().replaceAll(/[^0-9]/g, '') + '-' + id);
@@ -29,9 +31,8 @@ function docker(args, input) {
     try { return execFileSync(command, [...prefix, ...args], { input, encoding: 'utf8', timeout: 30000, maxBuffer: 64e6, stdio: ['pipe', 'pipe', 'pipe'] }).trim(); }
     catch (e) { throw Error(redact(e.stderr || e.message)); }
 }
-const sqlArgs = db => ['exec', '-i', pg, 'psql', '-XqAt', '-U', 'postgres', '-d', db, '-v', 'ON_ERROR_STOP=1'];
+const sqlArgs = adminArgs;
 const sql = (text, db = id) => docker(sqlArgs(db), text);
-const inspect = name => JSON.parse(docker(['inspect', name]))[0];
 function check(actual, expected, message) { assert.deepEqual(actual, expected, message); report.checks++; }
 async function until(predicate, label, timeout = 5000) {
     const end = Date.now() + timeout;
@@ -104,15 +105,17 @@ async function queued(label, options = {}) {
     await until(() => events('queue-enter') > before, label + ' entered queue');
     return handle;
 }
-function scenario(name, run, timeout = 20000) {
-    test(name, async () => {
+function scenario(name, run, timeout = 20000, requiresProc = false) {
+    const skip=requiresProc&&!hasProc;
+    if(skip){report.scenarios.push({name,status:'skipped',reason:'Linux /proc resource sampling unavailable'});console.warn('[pgrest queue] skipped: '+name+' (requires Linux /proc)');}
+    test.skipIf(skip)(name, async () => {
         const entry = { name, status: 'running' }, before = report.checks, start = Date.now(); report.scenarios.push(entry);
         try { await run(entry); entry.status = 'passed'; }
         catch (e) { entry.status = 'failed'; entry.error = redact(e.stack); throw e; }
         finally { entry.checks = report.checks - before; entry.ms = Date.now() - start; }
     }, timeout);
 }
-const dsn = `host=127.0.0.1 port=5432 dbname=${id} user=${id} password=${password}`;
+const dsn = `host=${fixture.host} port=${fixture.port} dbname=${id} user=${id} password=${password}`;
 function config(debug = true) {
     const routes = [['api',128,'5s'],['sibling',128,'5s'],['cap',2,'5s'],['off',0,'5s'],['zero',128,'0'],['race',128,'1s']].map(([route, size, timeout]) =>
         `location /${route}/ { rewrite ^/${route}/(.*)$ /$1 break; pgrest_pass "${dsn}"; pgrest_schemas queue; pgrest_pool_size 1; pgrest_pool_queue_size ${size}; pgrest_pool_acquisition_timeout ${timeout}; pgrest_json_scalar on; }`).join('\n');
@@ -130,14 +133,11 @@ function sample() {
     const connections = Number(sql(`SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND usename=${lit(id)}`));
     return { pid, rssKiB, fd, connections };
 }
-describe('pgrest acquisition queue with real PostgreSQL', () => {
+describe.skipIf(Boolean(fixture.skip))('pgrest acquisition queue with real PostgreSQL', () => {
 beforeAll(async () => {
     mkdirSync(runtime, { recursive: true, mode: 0o700 });
-    check(process.platform, 'linux', 'queue resource sampling requires Linux /proc');
     assert(Number.isFinite(soakSeconds) && soakSeconds >= 60 && soakSeconds <= 3600, 'PGREST_QUEUE_SOAK_SECONDS must be 60–3600');
-    const database = inspect(pg); if (!database.State.Running) docker(['start',pg]);
-    report.postgres_image = database.Image;
-    const data = sql('SHOW data_directory', 'postgres'); check(database.Mounts.some(m => m.Type === 'volume' && (data === m.Destination || data.startsWith(m.Destination + '/'))), true, 'named database volume');
+    report.postgres_image = fixture.info.Image; report.volume=fixture.mount.Name; report.postgres_host=fixture.host; report.postgres_port=fixture.port;
     // tests/preload.js builds this binary for the normal `bun test` command.
     const binaryPath = fileURLToPath(new URL('../../zig-out/bin/nginz', import.meta.url));
     report.candidate_sha256 = createHash('sha256').update(readFileSync(binaryPath)).digest('hex');
@@ -178,14 +178,13 @@ afterAll(async () => {
                 const deadline = setTimeout(() => nginz.kill('SIGKILL'), 5000);
                 try {await exited;} finally {clearTimeout(deadline);}
             }
-            const text = logs();
-            check(/\[(?:alert|emerg)\]|signal 11|worker process .* exited on signal|request count is zero/i.test(text),false,'no crash or nginx lifetime alerts');
+            if(existsSync(logPath))check(/\[(?:alert|emerg)\]|signal 11|worker process .* exited on signal|request count is zero/i.test(logs()),false,'no crash or nginx lifetime alerts');
         } catch (e) {failures.push(e);}
     }
     try {if (databaseCreated) sql(`DROP DATABASE ${id} WITH (FORCE)`,'postgres');} catch (e) {failures.push(e);}
     try {if (roleCreated) sql(`DROP ROLE ${id}`,'postgres');} catch (e) {failures.push(e);}
     report.cleaned = failures.length === 0;
-    report.status = report.cleaned && report.scenarios.length === 9 && report.scenarios.every(s => s.status === 'passed') ? 'passed' : 'failed';
+    report.status = report.cleaned && report.scenarios.length === 9 && report.scenarios.every(s => ['passed','skipped'].includes(s.status)) ? 'passed' : 'failed';
     if (failures.length) report.cleanup_errors = failures.map(e => redact(e.stack));
     writeFileSync(join(evidence,'report.json'),JSON.stringify(report,null,2)+'\n',{mode:0o600});
     console.log('Queue audit '+report.status+': '+join(evidence,'report.json'));
@@ -285,7 +284,7 @@ afterAll(async () => {
         check(ledger('reload-'),['reload-active',...Array.from({length:6},(_,i)=>'reload-'+i)],'old queue drained FIFO exactly once');
         await until(()=>workers().every(pid=>!old.includes(pid)),'old worker exited',10000);
         await ok(call('reload-recovery',{read:true}),'new worker ready');
-    });
+    },20000,true);
     scenario('sustained saturation with bounded memory, descriptors and tail latency', async entry => {
         // No debug log I/O in measurements. Reload before warm-up, not during samples.
         const old=workers(); put({'nginx.conf':config(false)});
@@ -305,5 +304,5 @@ afterAll(async () => {
         for(const s of [...entry.samples,entry.after]){check(s.pid,entry.baseline.pid,'worker stable');check(s.connections,1,'one DB slot');check(s.fd<=entry.baseline.fd+2,true,'bounded descriptors');check(s.rssKiB<=entry.baseline.rssKiB+16384,true,'RSS within 16MiB after warm-up');}
         check(entry.latency_ms.p99<2000,true,'p99 below 2s with 5s acquisition deadline');
         await ok(call('soak-recovery'),'post-soak write');
-    }, (soakSeconds + 45) * 1000);
+    }, (soakSeconds + 45) * 1000,true);
 });

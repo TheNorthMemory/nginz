@@ -335,7 +335,8 @@ itself and requires no WAF, njs, Redis or extra database requests.
 
 The real-PostgreSQL security suite is
 `bun test tests/pgrest/pgrest.security.container.test.js`. It reuses the existing
-`pgrest-nginz-test` container, creates only its own temporary database/roles,
+selected disposable container (`PGREST_TEST_CONTAINER`, default
+`pgrest-nginz-test`), creates only its own temporary database/roles,
 and covers authenticated attacks, JWT rejection, fixed app-style RPC routes,
 table writes, arrays, parameter overflow, and valid-request recovery.
 
@@ -1402,6 +1403,13 @@ JWT isolation, no spill after SQL/commit failures, once-only handoff, unavailabl
 or exhausted backup, njs/SSI/auth subrequests, HTTP/2 reset, queued cancellation,
 release/deadline races and graceful reload. These are local regression results,
 not a production throughput claim.
+
+The public suite has no application-repository or host-specific infrastructure
+dependency. Optional PostgreSQL/PostgREST suites report explicit skips when their
+fixtures are unavailable; assertions and setup errors after discovery still fail tests. Container
+ports, networking and named data-volume paths are discovered. See
+[`tests/pgrest/README.md`](../../../tests/pgrest/README.md) for portable fixture
+settings and the two queue cases that require Linux `/proc`.
 
 ### Shared-container budgeting and stress regression
 

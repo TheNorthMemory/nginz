@@ -10,7 +10,7 @@ export function dockerCommand() {
   for (const command of [["docker"], ["sudo", "-n", "docker"]]) {
     try {
       const result = spawnSync([...command, "info", "--format", "{{.ServerVersion}}"], {
-        stdout: "pipe", stderr: "pipe",
+        stdout: "pipe", stderr: "pipe", timeout: 5000,
       });
       if (result.exitCode === 0) {
         docker = command;

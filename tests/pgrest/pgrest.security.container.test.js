@@ -5,10 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { dockerCommand } from "../docker.js";
+import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL, stableFetch } from "../harness.js";
 
 const MODULE = "pgrest-security";
-const PG = "pgrest-nginz-test";
+const fixture=await postgresFixture(); explainSkip('security',fixture);
 const RUN = "pgrest_security_" + randomBytes(6).toString("hex");
 const AUTH = RUN + "_authenticator", USER = RUN + "_api", ANON = RUN + "_anon";
 const SECRET = randomBytes(32).toString("hex"), PASSWORD = randomBytes(32).toString("hex");
@@ -16,7 +17,7 @@ const JSON_TYPE = "application/json", FORM_TYPE = "application/x-www-form-urlenc
 const run = (command, options) => spawnSync(command[0], command.slice(1), options);
 
 function sql(text, database = RUN) {
-  const result = run([...dockerCommand(), "exec", "-i", PG, "psql", "-X", "-q", "-t", "-A", "-U", "postgres", "-d", database, "-v", "ON_ERROR_STOP=1"], {
+  const result = run([...dockerCommand(), ...adminArgs(database)], {
     input: text, encoding: "utf8", timeout: 30000,
   });
   if (result.status !== 0) throw new Error("Security fixture SQL failed: " + result.stderr);
@@ -44,15 +45,9 @@ function expectUnchanged() {
   expect(sql("SELECT jsonb_agg(jsonb_build_array(id,value) ORDER BY id) FROM audit.items")).toBe('[[1, "first"], [2, "second"]]');
 }
 
-describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
+describe.skipIf(Boolean(fixture.skip))("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   let directory, roles = false, database = false;
   beforeAll(async () => {
-    const running = run([...dockerCommand(), "inspect", "--format", "{{.State.Running}}", PG], { encoding: "utf8" });
-    if (running.status !== 0) throw new Error("The existing PostgreSQL test container is required");
-    if (running.stdout.trim() !== "true") {
-      const started = run([...dockerCommand(), "start", PG], { encoding: "utf8" });
-      if (started.status !== 0) throw new Error(started.stderr);
-    }
     sql(`CREATE ROLE ${USER} NOLOGIN; CREATE ROLE ${ANON} NOLOGIN;
       CREATE ROLE ${AUTH} LOGIN NOINHERIT PASSWORD '${PASSWORD}'; GRANT ${USER},${ANON} TO ${AUTH};`, "postgres");
     roles = true;
@@ -77,7 +72,7 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
       jwt_require_claim sub eq fixture; jwt_require_claim role eq ${USER}; jwt_require_claim appid eq fixture-client;
       jwt_require_claim app eq ${RUN}; jwt_require_claim oid !eq ""; jwt_require_claim exp gt 0;
       jwt_validate_exp on; jwt_validate_sig on;`;
-    const pg = `pgrest_pass "host=127.0.0.1 port=5432 dbname=${RUN} user=${AUTH} password=${PASSWORD} connect_timeout=3";
+    const pg = `pgrest_pass "host=${fixture.host} port=${fixture.port} dbname=${RUN} user=${AUTH} password=${PASSWORD} connect_timeout=3";
       pgrest_schemas audit; pgrest_pool_size 2; pgrest_json_scalar on; pgrest_jwt_secret "${SECRET}"; pgrest_anon_role ${ANON};`;
     const path = join(directory, "nginx.conf");
     writeFileSync(path, `daemon off; error_log logs/error.log debug; pid logs/nginx.pid;

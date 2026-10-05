@@ -1,57 +1,26 @@
 import { dockerCommand } from "../docker.js";
+import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
+import {randomBytes} from 'node:crypto';
+import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
 
 const MODULE = "pgrest";
-const PG_CONTAINER = "pgrest-nginz-test";
-const PG_USER = "nginz_test";
-const PG_PASSWORD = "nginz_test_pass";
-const PG_DB = "nginz_test";
+const fixture=await postgresFixture(); explainSkip('integration',fixture);
+const PG_USER = 'pgrest_integration_'+randomBytes(6).toString('hex');
+const PG_PASSWORD = randomBytes(24).toString('hex');
+const PG_DB = PG_USER;
 
 // ---------------------------------------------------------------------------
 // Shell helpers
 // ---------------------------------------------------------------------------
 
-function runResult(command) {
-  const result = Bun.spawnSync(command, {
-    stdout: "pipe",
-    stderr: "pipe",
-    cwd: process.cwd(),
-    env: process.env,
-  });
-  return {
-    exitCode: result.exitCode,
-    stdout: result.stdout ? Buffer.from(result.stdout).toString() : "",
-    stderr: result.stderr ? Buffer.from(result.stderr).toString() : "",
-  };
-}
-
-function run(command) {
-  const result = runResult(command);
-  if (result.exitCode !== 0) {
-    throw new Error(`Command failed: ${command.join(" ")}\n${result.stdout}${result.stderr}`.trim());
-  }
-  return result;
-}
-
-function ensureContainerRunning(name) {
-  const result = runResult([...dockerCommand(), "inspect", "--format", "{{.State.Running}}", name]);
-  if (result.exitCode !== 0 || !result.stdout.trim().includes("true")) {
-    throw new Error(`Container ${name} is not running. Start it before running container tests.`);
-  }
-}
-
-function ensureHostPortOpen(host, port) {
-  const result = runResult(["nc", "-z", host, String(port)]);
-  if (result.exitCode !== 0) {
-    throw new Error(`Port ${port} on ${host} is not reachable. Ensure the PostgreSQL container exposes host port ${port} (e.g., -p ${port}:${port}).`);
-  }
-}
-
 // Run SQL as the postgres superuser (trust from inside the container).
 function psqlAdmin(sql) {
   const result = Bun.spawnSync(
-    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres"],
+    [...dockerCommand(), ...adminArgs()],
     { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
@@ -64,7 +33,7 @@ function psqlAdmin(sql) {
 
 function psqlAdminDb(sql) {
   const result = Bun.spawnSync(
-    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres", "-d", PG_DB],
+    [...dockerCommand(), ...adminArgs(PG_DB)],
     { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
@@ -78,8 +47,8 @@ function psqlAdminDb(sql) {
 // Run SQL as the test user against the test database.
 function psqlDb(sql) {
   const result = Bun.spawnSync(
-    [...dockerCommand(), "exec", "-i", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_DB],
-    { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(sql) }
+    [...dockerCommand(), ...adminArgs(PG_DB)],
+    { stdout: "pipe", stderr: "pipe", stdin: Buffer.from(`SET ROLE ${PG_USER};\n`+sql) }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString() : "";
   const stderr = result.stderr ? Buffer.from(result.stderr).toString() : "";
@@ -222,26 +191,28 @@ function fetchClose(url, init = {}) {
   return fetch(url, { ...init, headers });
 }
 
-describe("pgrest module - real PostgreSQL 18 integration", () => {
+describe.skipIf(Boolean(fixture.skip))("pgrest module - real PostgreSQL integration", () => {
+  let roleCreated=false,databaseCreated=false,configDir;
   beforeAll(async () => {
-    ensureContainerRunning(PG_CONTAINER);
-    ensureHostPortOpen("127.0.0.1", 5432);
-
     // Create test user and database
-    psqlAdmin(`CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASSWORD}';`);
-    run([...dockerCommand(), "exec", PG_CONTAINER, "createdb", "-U", "postgres", `--owner=${PG_USER}`, PG_DB]);
+    psqlAdmin(`CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASSWORD}';`); roleCreated=true;
+    psqlAdmin(`CREATE DATABASE ${PG_DB} OWNER ${PG_USER};`); databaseCreated=true;
     psqlDb(SETUP_SQL);
     psqlAdminDb(RESTRICTED_SQL);
 
-    await startNginz(`tests/${MODULE}/nginx.container.conf`, MODULE);
+    configDir=mkdtempSync(join(tmpdir(),'nginz-pgrest-integration-'));
+    const configPath=join(configDir,'nginx.conf');
+    writeFileSync(configPath,readFileSync(`tests/${MODULE}/nginx.container.conf`,'utf8')
+      .replaceAll('host=127.0.0.1 port=5432 dbname=nginz_test user=nginz_test password=nginz_test_pass',
+        `host=${fixture.host} port=${fixture.port} dbname=${PG_DB} user=${PG_USER} password=${PG_PASSWORD}`),{mode:0o600});
+    await startNginz(configPath, MODULE);
   }, 60000);
 
   afterAll(async () => {
     await stopNginz();
 
-    try { run([...dockerCommand(), "exec", PG_CONTAINER, "dropdb", "-U", "postgres", "--if-exists", PG_DB]); } catch {}
-    try { psqlAdmin(`DROP USER IF EXISTS ${PG_USER};`); } catch {}
-
+    try {if(databaseCreated)psqlAdmin(`DROP DATABASE ${PG_DB} WITH (FORCE);`);}
+    finally {if(roleCreated)psqlAdmin(`DROP USER ${PG_USER};`);if(configDir)rmSync(configDir,{recursive:true,force:true});}
     cleanupRuntime(MODULE);
   }, 30000);
 

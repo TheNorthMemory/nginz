@@ -1,26 +1,26 @@
 import { dockerCommand } from "../docker.js";
+import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { startNginz, stopNginz, cleanupRuntime, testFetch } from "../harness.js";
 
 const MODULE = "pgrest";
-const PG_CONTAINER = "pgrest-nginz-test";
+const fixture=await postgresFixture(); explainSkip('scalar JSON',fixture);
 const PG_PASSWORD = "nginz_test_pass";
 const RUN_NAME = `pgrest_scalar_${process.pid}_${Date.now().toString(36)}`;
 const LIMIT_ERROR = { message: "PostgreSQL response exceeds pgrest serialization limit" };
 
 function psql(sql, database = "postgres") {
   const result = Bun.spawnSync([
-    ...dockerCommand(), "exec", "-i", PG_CONTAINER,
-    "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database,
+    ...dockerCommand(), ...adminArgs(database),
   ], { stdin: Buffer.from(sql), stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) {
     throw new Error(`PostgreSQL scalar fixture failed: ${result.stdout.toString()}${result.stderr.toString()}`);
   }
 }
 
-describe("pgrest scalar JSON with real PostgreSQL", () => {
+describe.skipIf(Boolean(fixture.skip))("pgrest scalar JSON with real PostgreSQL", () => {
   let configDir;
   let roleCreated = false;
   let databaseCreated = false;
@@ -55,7 +55,7 @@ describe("pgrest scalar JSON with real PostgreSQL", () => {
     const configPath = join(configDir, "nginx.conf");
     const config = readFileSync(`tests/${MODULE}/nginx.json-scalar.conf`, "utf8")
       .replaceAll("host=127.0.0.1 port=15432 dbname=testdb user=postgres",
-        `host=127.0.0.1 port=5432 dbname=${RUN_NAME} user=${RUN_NAME} password=${PG_PASSWORD}`)
+        `host=${fixture.host} port=${fixture.port} dbname=${RUN_NAME} user=${RUN_NAME} password=${PG_PASSWORD}`)
       .replace("js_import scalar from json_scalar_subrequest.js;",
         `js_import scalar from ${join(process.cwd(), "tests", MODULE, "json_scalar_subrequest.js")};`);
     writeFileSync(configPath, config);

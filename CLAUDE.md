@@ -131,6 +131,15 @@ Access nginx APIs through the ngx namespace:
 
 ### Testing
 
+Nginz is a standalone public project. Tests must not depend on sibling apps,
+private credentials, this checkout's host, a particular container network mode,
+or a particular named-volume mount path. Discover or explicitly configure service
+fixtures. Missing optional external services must produce visible skips with a
+reason; assertion failures and errors after prerequisite discovery still fail.
+Cleanup must tolerate setup ending before processes, files or databases exist.
+`bun test tests/pgrest` runs its self-contained cases without Docker; see
+`tests/pgrest/README.md` for optional PostgreSQL/PostgREST fixture settings.
+
 Integration tests use Bun and run against a live nginx instance:
 If used wrong, bun test could introduce false positives by itself, use curl to double confirm.
 `bunfig.toml` sets `maxConcurrency = 1` so suites do not race fixed ports (8888 / mock ports).

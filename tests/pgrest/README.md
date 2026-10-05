@@ -10,27 +10,51 @@ The standard preload builds the local nginz binary. No sibling application
 checkout, application credentials, saved settings or app container is needed.
 The suite includes mock wire-protocol tests, PostgreSQL integration/security/
 serialization tests, nine acquisition-queue tests and twelve delayed-spill
-tests against PostgREST 16.4. All run by default.
+tests against PostgREST 16.4. Available tests run automatically. External-service
+suites are optional: missing Docker, a test database or the local PostgREST image
+produces explicit Bun skips with a reason, not setup/cleanup failures. The mock
+and configuration tests still run. A failed assertion after setup is never
+converted to a skip.
 
 ## Prerequisites
 
 - The normal nginz build dependencies, including Zig 0.16, Bun and libpq.
-- Linux for the queue suite's `/proc` worker, memory and descriptor checks.
-- Docker access (directly or through the existing `sudo -n docker` fallback).
-- The existing PostgreSQL test container `pgrest-nginz-test`, exposing port
-  5432 on localhost, with a named data volume and local `postgres` superuser
-  access via `docker exec ... psql -U postgres`. PostgreSQL 18 is the tested
-  version. Retain the fixture and its volume between runs; start it if stopped.
-- `nc`, used by the existing PostgreSQL integration readiness check.
-- The locally pulled `postgrest/postgrest:v16.4` image and `tar`. The spill suite
+- Optional Docker access (directly or through `sudo -n docker`) and a disposable
+  PostgreSQL test container. The default name is `pgrest-nginz-test`; override it
+  with `PGREST_TEST_CONTAINER`. Tests discover its port, published endpoints,
+  container addresses and writable named data volume. No network name, host
+  network mode, volume name or mount path is required. A stopped selected fixture
+  is started and reused. Local `psql` superuser access inside that fixture is
+  required; PostgreSQL 18 is tested. No `nc` dependency is needed.
+- Linux `/proc` is needed only for two queue tests that inspect worker lifetime,
+  memory and descriptors. Those two cases skip when `/proc` is unavailable;
+  the other queue cases still run if PostgreSQL is available.
+- Optional local `postgrest/postgrest:v16.4` image and `tar`. The spill suite
   extracts that image's static binary and runs it inside the existing PostgreSQL
-  fixture, using a private temporary directory in its named `pg18` volume.
+  fixture, using its own private temporary directory in the discovered data volume.
   No additional container, application checkout or supervisor is required.
-  The existing fixture uses host networking for loopback access.
+  Host and directly reachable bridge/custom container networks are supported.
+  With Docker Desktop or remote Docker, ordinary database tests can use published
+  ports; spill skips if a temporary HTTP port in the container is unreachable.
+  The PostgREST and PostgreSQL image architectures must match.
 
-Missing infrastructure fails the suite explicitly. There is no opt-in or silent
-skip for real-database or queue tests. Fixture SQL creates disposable users and
-databases; use a test PostgreSQL service, never a production database.
+No test automatically pulls images, creates/replaces containers or changes
+networking or volumes. Tests create uniquely named databases and roles and remove
+only their own resources. Select a disposable test service, never production.
+
+| Environment variable | Default / purpose |
+|---|---|
+| `PGREST_TEST_CONTAINER` | `pgrest-nginz-test`; explicit disposable PostgreSQL fixture |
+| `PGREST_TEST_HOST` | Discover from published ports/container network; override for remote Docker |
+| `PGREST_TEST_PORT` | Discover the published/database port; optional host-port override |
+| `PGREST_TEST_ADMIN` | `postgres`; local fixture administrator |
+| `PGREST_TEST_CONTAINER_PORT` | Container's `psql` default; override a nonstandard server port |
+| `PGREST_SPILL_POSTGREST_IMAGE` | `postgrest/postgrest:v16.4`; locally available oracle image, including mirrors |
+
+Invalid explicit host/port settings fail clearly. Missing optional dependencies
+are announced once per suite and counted as skipped tests, so test results show
+which integration coverage actually ran. Cleanup handles partial setup without
+reading logs or deleting resources that were never created.
 
 ## Acquisition queue coverage
 
