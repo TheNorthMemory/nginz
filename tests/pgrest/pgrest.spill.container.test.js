@@ -1,11 +1,11 @@
 // Native overflow regression, independent of all application repositories.
-// Reuse the PostgreSQL container and its named volume. Extract the static
-// PostgREST binary from the locally pulled image; no helper container is needed.
+// Reuse the PostgreSQL fixture and named volume. Start an owned PostgREST
+// container only from a local image, never pull/export/extract/install it.
 import { beforeAll, afterAll, afterEach, describe, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, openSync, closeSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect, constants } from 'node:http2';
 import { createServer, isIP } from 'node:net';
@@ -14,15 +14,15 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dockerCommand } from '../docker.js';
 import {postgresFixture,pgContainer,adminArgs,explainSkip} from './container-fixture.js';
+import {postgrestFixture,postgrestContainerArgs} from './postgrest-fixture.js';
 
 const pg = pgContainer;
-const image = process.env.PGREST_SPILL_POSTGREST_IMAGE || 'postgrest/postgrest:v16.4';
 const id = 'spill_' + randomBytes(5).toString('hex');
 const secret = randomBytes(32).toString('hex'), password = randomBytes(24).toString('hex');
 const runtime = resolve(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'nginz/tests/pgrest-spill', id);
 const binary = fileURLToPath(new URL('../../zig-out/bin/nginz', import.meta.url));
 const lit = x => "'" + String(x).replaceAll("'", "''") + "'";
-let port, backendPort, downPort, nginz, postgrest, gateProcess, containerPath, created = false, roleCreated = false;
+let port, backendPort, downPort, nginz, gateProcess, postgrestId, created = false, roleCreated = false;
 const pending = new Set(), scenarios = [];
 const report = { status: 'running', scenarios };
 function docker(args, input, encoding = 'utf8') {
@@ -31,27 +31,11 @@ function docker(args, input, encoding = 'utf8') {
 }
 const sqlArgs = adminArgs;
 const sql = (s, db = id) => docker(sqlArgs(db), s).trim();
-const shellQuote = x => "'" + String(x).replaceAll("'", "'\\''") + "'";
 async function prerequisites() {
-    // Optional oracle: inspect before creating any database, role or volume files.
-    // An absent oracle must not turn the standalone module suite into a failure.
-    let oracle;
+    // Missing optional fixtures skip before any database/container is created.
     try { dockerCommand(); } catch { return {skip:'Docker is unavailable'}; }
-    try { oracle=JSON.parse(docker(['image','inspect',image]))[0]; }
-    catch { return {skip:`local PostgREST image ${image} is unavailable (no automatic pull)`}; }
-    try { execFileSync('tar',['--version'],{stdio:'ignore'}); }
-    catch { return {skip:'tar is unavailable for extracting the PostgREST binary'}; }
-    const database=await postgresFixture();if(database.skip)return database;
-    const {info,mount}=database;
-    let postgresImage;
-    try { postgresImage=JSON.parse(docker(['image','inspect',info.Image]))[0]; }
-    catch { return {skip:'PostgreSQL image metadata is unavailable'}; }
-    if (oracle.Os!=='linux' || oracle.Architecture!==postgresImage.Architecture) return {skip:'PostgREST and PostgreSQL container platforms do not match'};
-    // The PostgREST process runs inside this container on a temporary port.
-    // Use a reachable container address on bridge networks, or loopback on host
-    // networking. Published PostgreSQL ports alone cannot expose that process.
-    if(!database.directHost)return {skip:`no directly reachable address for ${pg}; spill needs access to a temporary in-container HTTP port`};
-    return {...database,postgresPort:database.port,backupHost:database.directHost,mount,image:oracle.Id,network:info.HostConfig.NetworkMode};
+    const database=await postgrestFixture(postgresFixture);if(database.skip)return database;
+    return {...database,postgresPort:database.port,backupHost:database.backup.host,network:database.info.HostConfig.NetworkMode};
 }
 const fixture=await prerequisites();
 explainSkip('spill',fixture);
@@ -148,27 +132,6 @@ beforeAll(async () => {
     report.volume=fixture.mount.Name; report.network=fixture.network; report.postgres_host=fixture.host; report.postgres_port=fixture.postgresPort;
     [port, backendPort, downPort] = await Promise.all([freePort(),freePort(),freePort()]);
     report.image = fixture.image;
-    // Open the archive as the test user even when Docker requires sudo. Stream
-    // it without a buffer-size assumption or root-owned output file.
-    const archive = join(runtime,'image.tar'), archiveFd=openSync(archive,'wx',0o600);
-    try {const [command,...prefix]=dockerCommand();execFileSync(command,[...prefix,'image','save',image],{timeout:30000,stdio:['ignore',archiveFd,'pipe']});}
-    finally {closeSync(archiveFd);}
-    const manifest = JSON.parse(execFileSync('tar',['-xOf',archive,'manifest.json'],{encoding:'utf8'}))[0];
-    let executable;
-    for (const layer of manifest.Layers) {
-        const bytes = execFileSync('tar',['-xOf',archive,layer],{maxBuffer:64e6});
-        const names = execFileSync('tar',['-tf','-'],{input:bytes,encoding:'utf8',maxBuffer:64e6}).split('\n');
-        const entry = names.find(n => n.replace(/^\.\//,'')==='bin/postgrest');
-        if (entry) executable = execFileSync('tar',['-xOf','-',entry],{input:bytes,maxBuffer:64e6});
-    }
-    assert(executable, 'static binary present in pinned image');
-    writeFileSync(join(runtime,'postgrest'),executable,{mode:0o755});
-    const target=fixture.dataDirectory + '/.nginz-' + id;
-    docker(['exec',pg,'mkdir','-m','700',target]); containerPath=target;
-    // Write as the container's configured user. docker cp would create root-
-    // owned 0600 config files, breaking non-root PostgreSQL images.
-    docker(['exec','-i',pg,'sh','-c','umask 077; cat > "$1"; chmod 700 "$1"','sh',containerPath+'/postgrest'],executable);
-    assert.equal(docker(['exec',pg,containerPath+'/postgrest','--version']).trim(),'PostgREST 16.4');
     sql(`CREATE ROLE ${id} LOGIN PASSWORD ${lit(password)}`,'postgres'); roleCreated = true;
     sql(`CREATE DATABASE ${id}`,'postgres'); created = true;
     sql(`CREATE SCHEMA spill AUTHORIZATION ${id}; SET ROLE ${id};
@@ -176,12 +139,15 @@ beforeAll(async () => {
     CREATE FUNCTION spill.read(value text DEFAULT '',delay double precision DEFAULT 0) RETURNS jsonb STABLE LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(delay); RETURN jsonb_build_object('value',value,'owner',current_setting('request.jwt.claims',true)::jsonb->>'oid','method',current_setting('request.method',true),'header',current_setting('request.headers',true)::jsonb->>'x-test'); END $$;
     CREATE FUNCTION spill.write(label text,gate boolean DEFAULT false,delay double precision DEFAULT 0,bad boolean DEFAULT false) RETURNS text LANGUAGE plpgsql AS $$ BEGIN IF gate THEN PERFORM pg_advisory_xact_lock(792415); END IF; PERFORM pg_sleep(delay); INSERT INTO spill.ledger(label) VALUES(write.label); IF bad THEN PERFORM set_config('response.status','invalid',true); END IF; RETURN label; END $$;
     CREATE FUNCTION spill.fail(code text) RETURNS text STABLE LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE=code,MESSAGE='fixture error'; END $$;`);
-    const conf = `db-uri="host=127.0.0.1 port=${fixture.containerPort} dbname=${id} user=${id} password=${password} application_name=spill_backup"\ndb-schemas="spill"\ndb-pool=1\ndb-pool-acquisition-timeout=1\ndb-channel-enabled=false\njwt-secret="${secret}"\njwt-aud="spill"\nserver-host="${fixture.network==='host'?'127.0.0.1':isIP(fixture.backupHost)===6?'::':'0.0.0.0'}"\nserver-port=${backendPort}\nopenapi-mode="disabled"\nlog-level="crit"\n`;
-    writeFileSync(join(runtime,'postgrest.conf'),conf,{mode:0o600});
-    docker(['exec','-i',pg,'sh','-c','umask 077; cat > "$1"','sh',containerPath+'/postgrest.conf'],conf);
-    const [command,...prefix] = dockerCommand();
-    postgrest = spawn(command,[...prefix,'exec',pg,'sh','-c',`echo $$ > ${shellQuote(containerPath+'/pid')}; exec ${shellQuote(containerPath+'/postgrest')} ${shellQuote(containerPath+'/postgrest.conf')} +RTS -N1 -RTS`],{stdio:['ignore','ignore','pipe']});
-    postgrest.stderr.on('data',b=>appendFileSync(join(runtime,'postgrest.log'),b,{mode:0o600}));
+    postgrestId=docker(postgrestContainerArgs(fixture,{name:id+'-postgrest',database:id,password,secret,port:backendPort})).trim();
+    report.postgrest_container=postgrestId;
+    docker(['start',postgrestId]);
+    assert.equal(docker(['exec',postgrestId,'/bin/postgrest','--version']).trim(),'PostgREST 16.4');
+    if(fixture.backup.publish){
+        const info=JSON.parse(docker(['inspect',postgrestId]))[0];
+        backendPort=Number(info.NetworkSettings.Ports['3000/tcp'][0].HostPort);
+        assert(Number.isInteger(backendPort)&&backendPort>0,'published PostgREST port');
+    }
     writeFileSync(join(runtime,'nginx.conf'),config(),{mode:0o600});
     writeFileSync(join(runtime,'subrequest.mjs'),`async function call(r) { const s=await r.subrequest('/api/rpc/write',{method:'POST',body:r.requestText}); r.return(s.status,s.responseText); } export default {call};`,{mode:0o600});
     nginz = spawn(binary,['-p',runtime,'-c',join(runtime,'nginx.conf'),'-g','daemon off;'],{stdio:['ignore','ignore','pipe']});
@@ -194,9 +160,9 @@ afterAll(async()=>{
     const failures=[];
     try {for(const r of pending)r.destroy();await release();}catch(e){failures.push(e);}
     for(const p of [nginz]) if(p && p.exitCode===null && p.signalCode===null){const exit=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await exit;}
-    try {if(postgrest && postgrest.exitCode===null && postgrest.signalCode===null){docker(['exec',pg,'sh','-c',`kill -TERM "$(cat ${shellQuote(containerPath+'/pid')})"`]);await until(()=>postgrest.exitCode!==null || postgrest.signalCode!==null,'PostgREST stopped');}}catch(e){failures.push(e);}
+    try {if(postgrestId)writeFileSync(join(runtime,'postgrest.log'),docker(['logs',postgrestId]),{mode:0o600});}catch(e){failures.push(e);}
+    try {if(postgrestId)docker(['rm','-f',postgrestId]);}catch(e){failures.push(e);}
     try {if(created)sql(`DROP DATABASE ${id} WITH (FORCE)`,'postgres');if(roleCreated)sql(`DROP ROLE ${id}`,'postgres');}catch(e){failures.push(e);}
-    try {if(containerPath)docker(['exec',pg,'rm','-rf',containerPath]);}catch(e){failures.push(e);}
     try {if(existsSync(join(runtime,'error.log')))assert(!/\[(alert|emerg)\]|worker process .* exited on signal|request count is zero/.test(log()),'no nginx lifetime alerts');}catch(e){failures.push(e);}
     report.cleaned=failures.length===0;report.status=report.cleaned&&scenarios.length>0&&scenarios.every(s=>s.status==='passed')?'passed':'failed';
     writeFileSync(join(runtime,'report.json'),JSON.stringify(report,null,2)+'\n',{mode:0o600});console.log('Spill audit '+report.status+': '+join(runtime,'report.json'));

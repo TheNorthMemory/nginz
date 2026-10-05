@@ -75,6 +75,6 @@ async function discover() {
     for(const candidate of address.candidates)if(await reachable(candidate.host,candidate.port)){selected=candidate;break;}
     if(!selected)return {skip:`test container ${pgContainer} has no reachable PostgreSQL endpoint`};
     for(const candidate of address.direct)if(await reachable(candidate.host,candidate.port)){directHost=candidate.host;break;}
-    return {...selected,containerPort:port,directHost,info,mount,dataDirectory:data};
+    return {...selected,containerPort:port,directHost,info,mount,dataDirectory:data,daemonHost};
 }
 export function explainSkip(suite,fixture){if(fixture.skip)console.warn(`[pgrest ${suite}] skipped: ${fixture.skip}`);}

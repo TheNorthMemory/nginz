@@ -29,18 +29,21 @@ converted to a skip.
 - Linux `/proc` is needed only for two queue tests that inspect worker lifetime,
   memory and descriptors. Those two cases skip when `/proc` is unavailable;
   the other queue cases still run if PostgreSQL is available.
-- Optional local `postgrest/postgrest:v16.4` image and `tar`. The spill suite
-  extracts that image's static binary and runs it inside the existing PostgreSQL
-  fixture, using its own private temporary directory in the discovered data volume.
-  No additional container, application checkout or supervisor is required.
-  Host and directly reachable bridge/custom container networks are supported.
-  With Docker Desktop or remote Docker, ordinary database tests can use published
-  ports; spill skips if a temporary HTTP port in the container is unreachable.
-  The PostgREST and PostgreSQL image architectures must match.
+- Optional local `postgrest/postgrest:v16.4` image. When present, spill starts its
+  own temporary PostgREST container with `--pull=never` and configuration supplied
+  through environment variables. It removes that container after the tests,
+  including failed setup. When the image is absent, spill explicitly skips.
+  No `tar`, image export/extraction, host-installed PostgREST binary or host
+  PostgREST configuration is used. The existing PostgreSQL named volume is reused
+  for all database data; the stateless PostgREST container needs no new volume.
+  Host and reachable bridge/custom networks are supported. Docker Desktop uses
+  an ephemeral loopback HTTP mapping on the fixture's existing network. Remote
+  Docker requires a reachable host/container address; otherwise spill skips.
 
-No test automatically pulls images, creates/replaces containers or changes
-networking or volumes. Tests create uniquely named databases and roles and remove
-only their own resources. Select a disposable test service, never production.
+No test automatically pulls images or reconfigures existing containers, networking
+or volumes. Spill owns one temporary PostgREST container. Tests create uniquely
+named databases and roles and remove only their own resources. Select a
+disposable PostgreSQL test service, never production.
 
 | Environment variable | Default / purpose |
 |---|---|
@@ -98,6 +101,7 @@ failure/exhaustion, redirect loops, parent/subrequest lifetimes, cancellation,
 HTTP/2, twenty deadline races and graceful reload. HTTP calls are not retried.
 SQL effects prove writes execute once; worker logs must contain no lifetime or
 open-socket alerts. Reports live under `$XDG_STATE_HOME/nginz/tests/pgrest-spill/`
-(default `~/.local/state/nginz/tests/pgrest-spill/`). Cleanup terminates only the
-fixture's own PostgREST process and removes its own database, role and temporary
-volume directory. The existing container and named volume are retained.
+(default `~/.local/state/nginz/tests/pgrest-spill/`). Cleanup stops only this
+run's nginz, removes its own PostgREST container and drops its own database and
+role. The selected PostgreSQL fixture and named volumes are retained. Cleanup
+does not depend on setup having reached container startup or log creation.
