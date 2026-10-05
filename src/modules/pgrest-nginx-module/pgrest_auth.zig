@@ -227,7 +227,7 @@ pub fn build_clear_jwt_query(query_buf: []u8) ?usize {
     return q.len;
 }
 
-fn append_setting(query_buf: []u8, start: usize, prefix: []const u8, value: []const u8) ?usize {
+pub fn append_setting(query_buf: []u8, start: usize, prefix: []const u8, value: []const u8) ?usize {
     if (start + prefix.len + pgrest_sql.literal_size(value) >= query_buf.len) return null;
     @memcpy(query_buf[start..][0..prefix.len], prefix);
     return pgrest_sql.append_literal(query_buf, start + prefix.len, value);

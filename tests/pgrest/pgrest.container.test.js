@@ -280,7 +280,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const body = await res.json();
     expect(body).toEqual([
       {
-        id: "1",
+        id: 1,
         name: "Alice Smith",
         orders: [
           { id: 1, amount: 100 },
@@ -296,8 +296,8 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const body = await res.json();
     expect(body).toEqual([
       {
-        id: "1",
-        amount: "100.00",
+        id: 1,
+        amount: 100,
         user: { id: 1, name: "Alice Smith" },
       },
     ]);
@@ -309,22 +309,22 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const body = await res.json();
     expect(body).toEqual([
       {
-        id: "1",
+        id: 1,
         name: "Alice Smith",
         orders: [{ id: 1 }, { id: 2 }],
       },
       {
-        id: "2",
+        id: 2,
         name: "Bob Jones",
         orders: [{ id: 3 }],
       },
       {
-        id: "3",
+        id: 3,
         name: "Carol White",
         orders: [{ id: 4 }],
       },
       {
-        id: "4",
+        id: 4,
         name: "Dave Brown",
         orders: [{ id: 5 }],
       },
@@ -337,7 +337,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const body = await res.json();
     expect(body).toEqual([
       {
-        id: "1",
+        id: 1,
         teams: [
           { id: 1, name: "Platform", owner: { id: 2, name: "Bob Jones" } },
           { id: 2, name: "Growth", owner: { id: 1, name: "Alice Smith" } },
@@ -694,7 +694,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const id = inserted[0].id;
 
     const delRes = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
-    expect(delRes.status).toBe(200);
+    expect(delRes.status).toBe(204);
 
     const check = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`);
     const rows = await check.json();
@@ -851,7 +851,8 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     });
     expect(res.status).toBe(406);
     const body = await res.json();
-    expect(body.message).toContain("JSON object requested");
+    expect(body.code).toBe("PGRST116");
+    expect(body.message).toBe("Cannot coerce the result to a single JSON object");
   });
 
   test("pgrst.object+json with multiple matching rows returns 406", async () => {
@@ -860,7 +861,8 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     });
     expect(res.status).toBe(406);
     const body = await res.json();
-    expect(body.message).toContain("JSON object requested");
+    expect(body.code).toBe("PGRST116");
+    expect(body.message).toBe("Cannot coerce the result to a single JSON object");
   });
 
   test("nulls=stripped removes null fields from JSON array results", async () => {
@@ -984,10 +986,10 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json", Prefer: "max-affected=1" },
+      headers: { "Content-Type": "application/json", Prefer: "handling=strict,max-affected=1" },
       body: JSON.stringify({ status: "active" }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(204);
     expect(res.headers.get("preference-applied")).toContain("max-affected=1");
 
     await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
@@ -1005,14 +1007,17 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?status=eq.overflow_test`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json", Prefer: "max-affected=1" },
+      headers: { "Content-Type": "application/json", Prefer: "handling=strict,max-affected=1" },
       body: JSON.stringify({ age: 99 }),
     });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.message).toContain("max-affected");
+    expect(body.code).toBe("PGRST124");
 
-    // Cleanup regardless — module may have executed the SQL before rejecting
+    // A rejected write must leave every row unchanged.
+    const unchanged = await fetchClose(`${TEST_URL}/api/users?status=eq.overflow_test&select=age`);
+    expect(await unchanged.json()).toEqual([{age:20},{age:20},{age:20}]);
+    // Remove only this test's rows.
     psqlDb(`DELETE FROM users WHERE email IN ('${emails.join("','")}');`);
   });
 
@@ -1057,19 +1062,19 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   test("GET /api/no_such_table returns 404 for undefined table", async () => {
     const res = await fetchClose(`${TEST_URL}/api/no_such_table`);
     expect(res.status).toBe(404);
-    expect(await res.json()).toEqual({ message: "Undefined table" });
+    expect(await res.json()).toMatchObject({ code: "42P01", details: null, hint: null });
   });
 
   test("GET /rpc/no_such_function returns 404 for undefined function", async () => {
     const res = await fetchClose(`${TEST_URL}/rpc/no_such_function`);
     expect(res.status).toBe(404);
-    expect(await res.json()).toEqual({ message: "Undefined function" });
+    expect(await res.json()).toMatchObject({ code: "PGRST202", hint: null });
   });
 
   test("GET /rpc/broken_sql returns 400 for PostgreSQL syntax errors", async () => {
     const res = await fetchClose(`${TEST_URL}/rpc/broken_sql`);
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ message: "SQL syntax error" });
+    expect(await res.json()).toEqual({ code: "42601", message: "syntax error at end of input", details: null, hint: null });
   });
 
   test("POST /api/users duplicate email returns 409 for constraint violation", async () => {
@@ -1079,17 +1084,17 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
       body: JSON.stringify({ name: "Dup User", email: "alice@example.com", status: "active", age: 33 }),
     });
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ message: "Constraint violation" });
+    expect(await res.json()).toMatchObject({ code: "23505", hint: null });
   });
 
-  test("POST /api/readonly_docs returns 403 for insufficient privilege", async () => {
+  test("POST /api/readonly_docs returns 401 for anonymous insufficient privilege", async () => {
     const res = await fetchClose(`${TEST_URL}/api/readonly_docs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: "Denied" }),
     });
-    expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ message: "Insufficient privileges" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ code: "42501", details: null, hint: null });
   });
 
   // =========================================================================
@@ -1100,8 +1105,8 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const res = await fetchClose(`${TEST_URL}/api/active_users_view?age=gte.25&order=name.desc&limit=2`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([
-      { id: "4", name: "Dave Brown", email: "dave@example.com", status: "active", age: "45", bio: null },
-      { id: "2", name: "Bob Jones", email: "bob@example.com", status: "active", age: "25", bio: "Designer" },
+      { id: 4, name: "Dave Brown", email: "dave@example.com", status: "active", age: 45, bio: null },
+      { id: 2, name: "Bob Jones", email: "bob@example.com", status: "active", age: 25, bio: "Designer" },
     ]);
   });
 
@@ -1113,7 +1118,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body[0].id).toBe("1");
+    expect(body[0].id).toBe(1);
     expect(body[0].bio).toBe("Updated via view");
   });
 
@@ -1140,7 +1145,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     });
     expect(res.status).toBe(200);
     const rows = await res.json();
-    expect(rows[0].id).toBe("9999");
+    expect(rows[0].id).toBe(9999);
     expect(rows[0].name).toBe("Put User");
 
     await fetchClose(`${TEST_URL}/api/users?id=eq.9999`, { method: "DELETE" });
@@ -1277,7 +1282,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const delRes = await fetchClose(`${TEST_URL}/api/users?status=eq.todelete&limit=1&order=id.asc`, {
       method: "DELETE",
     });
-    expect(delRes.status).toBe(200);
+    expect(delRes.status).toBe(204);
 
     const check = await fetchClose(`${TEST_URL}/api/users?status=eq.todelete`);
     const remaining = await check.json();
@@ -1305,7 +1310,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
       headers: { "Content-Type": "application/json", Prefer: "return=headers-only" },
       body: JSON.stringify({ status: "inactive" }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(204);
     expect(res.headers.get("preference-applied")).toContain("return=headers-only");
     expect(await res.text()).toBe("");
 
@@ -1363,17 +1368,17 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(body[0].col5).toBe("tab\tchar");
   });
 
-  test("mixed text/integer types in same row — all are JSON strings", async () => {
+  test("mixed text/integer types retain their PostgreSQL JSON types", async () => {
     const res = await fetchClose(`${TEST_URL}/api/json_stress?id=eq.1`, {
       headers: { Accept: "application/json" },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    // pgrest returns all PG values as JSON strings (libpq text protocol)
+    // PostgreSQL owns serialization; integer columns remain JSON numbers.
     expect(typeof body[0].col1).toBe("string");
     expect(typeof body[0].col2).toBe("string");
-    expect(typeof body[0].col6).toBe("string");
-    expect(typeof body[0].col7).toBe("string");
+    expect(typeof body[0].col6).toBe("number");
+    expect(typeof body[0].col7).toBe("number");
     // Numeric-looking strings parse as integers
     expect(parseInt(body[0].col6)).toBe(1);
     expect(parseInt(body[0].col10)).toBe(5);

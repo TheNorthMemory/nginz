@@ -275,11 +275,19 @@ pub const CJSON = extern struct {
     /// Parse one complete UTF-8 document, rejecting duplicate object members
     /// and embedded NULs. All nodes, strings and validation scratch use the pool.
     pub fn decodeStrict(self: *Self, str: ngx_str_t) ![*c]cJSON {
+        const json = try self.decodeDocument(str);
+        try self.validateUniqueKeys(json, 0);
+        return json;
+    }
+
+    /// Complete JSON syntax and exact numeric tokens, allowing duplicate keys.
+    /// Consumers such as PostgREST use last-key-wins rather than JWT's strict
+    /// unique-key contract. This does not change decodeStrict's validation.
+    pub fn decodeDocument(self: *Self, str: ngx_str_t) ![*c]cJSON {
         if (str.len == 0 or str.data == null or !std.unicode.utf8ValidateSlice(str.data[0..str.len]))
             return core.NError.JSON_ERROR;
         const json = cJSON_ParseStrict(str.data, str.len, &self.alloc);
         if (json == null) return core.NError.JSON_ERROR;
-        try self.validateUniqueKeys(json, 0);
         return json;
     }
 

@@ -54,7 +54,7 @@ const PGRES_POLLING_READING = pq.PGRES_POLLING_READING;
 const PGRES_POLLING_WRITING = pq.PGRES_POLLING_WRITING;
 const PGRES_POLLING_OK = pq.PGRES_POLLING_OK;
 
-const MAX_PARAMS = 64;
+const MAX_PARAMS = 256;
 const PARAM_ARENA_SIZE = 8192;
 
 const NGX_OK = core.NGX_OK;
@@ -104,6 +104,8 @@ const ngx_pgrest_loc_conf_t = extern struct {
     json_scalar_max_size: usize,
     pool_size: ngx_int_t, // max pooled connections; NGX_CONF_UNSET means use default
     timeout: ngx_msec_t, // connect/query socket timeout
+    pool_acquisition_timeout: ngx_msec_t,
+    pool_queue_size: ngx_int_t,
 
     // JWT role-based access control
     jwt_secret: ngx_str_t,
@@ -169,12 +171,18 @@ const PgConnPool = struct {
     active_count: usize, // Number of active connections
     max_connections: usize, // Maximum allowed connections
     initialized: bool,
+    wait_head: ?*PgRequestCtx,
+    wait_tail: ?*PgRequestCtx,
+    wait_count: usize,
 
     pub fn init(self: *PgConnPool) void {
         self.initialized = false;
         self.active_count = 0;
         self.max_connections = POOL_DEFAULT_CONNECTIONS;
         self.conninfo_len = 0;
+        self.wait_head = null;
+        self.wait_tail = null;
+        self.wait_count = 0;
         for (&self.connections) |*c| {
             c.conn = null;
             c.state = .free;
@@ -207,7 +215,6 @@ const PgConnPool = struct {
 
     /// Release a connection back to pool
     pub fn releaseConn(self: *PgConnPool, pc: *PgPoolConn) void {
-        _ = self;
         if (pc.state == .conn_error or pc.conn == null) {
             // Failed connections must release both libpq's socket and the
             // ngx_connection_t wrapper allocated around that socket.
@@ -216,6 +223,7 @@ const PgConnPool = struct {
             // Return to idle state for reuse
             pc.state = .idle;
         }
+        wake_pool_waiter(self);
     }
 };
 
@@ -244,6 +252,10 @@ fn pool_slot_index(pool_conn: *PgPoolConn) usize {
 
 /// Per-request context for PostgreSQL operations
 const PgRequestCtx = extern struct {
+    wait_pool: ?*PgConnPool,
+    wait_previous: ?*PgRequestCtx,
+    wait_next: ?*PgRequestCtx,
+    wait_event: ngx_event_t,
     pool_conn: ?*PgPoolConn, // Assigned connection from pool
     query_state: PgQueryState, // Current query execution state
     rpc_phase: RpcExecutionPhase,
@@ -256,6 +268,22 @@ const PgRequestCtx = extern struct {
     followup_query_lens: [4]usize,
     followup_query_count: usize,
     result: ?*PGresult, // Query result
+    transaction_phase: enum(c_int) { none, setup, active, settings, commit, complete },
+    transaction_read_only: bool,
+    response_buf: ?*ngx_buf_t,
+    response_len: usize,
+    response_rows: i32,
+    response_content_type: [*:0]const u8,
+    response_override_status: ngx_uint_t,
+    response_headers: [*c]cjson.cJSON,
+    response_settings_error: enum(c_int) { none, headers, status },
+    canonical_json: bool,
+    rpc_scalar: bool,
+    rpc_setof: bool,
+    rpc_void: bool,
+    inline_count: bool,
+    page_limit: usize,
+    has_page_limit: bool,
     request: ?*ngx_http_request_t, // Back-reference to HTTP request
     response_format: ResponseFormat,
     singular_object: bool,
@@ -286,6 +314,7 @@ const PgRequestCtx = extern struct {
     // Parameterized query state: values collected during query building are
     // bound via PQsendQueryParams instead of inline SQL quoting.
     param_count: usize,
+    rpc_body_param_index: usize,
     param_overflow: bool,
     param_arena_used: usize,
     param_arena: [PARAM_ARENA_SIZE]u8,
@@ -440,6 +469,7 @@ fn append_sql_quoted(buf_out: []u8, pos_in: usize, value: []const u8) usize {
 
 fn params_reset(ctx: *PgRequestCtx) void {
     ctx.*.param_count = 0;
+    ctx.*.rpc_body_param_index = 0;
     ctx.*.param_overflow = false;
     ctx.*.param_arena_used = 0;
 }
@@ -451,6 +481,18 @@ fn params_add_text(ctx: *PgRequestCtx, value: []const u8) bool {
     }
     const needed = value.len + 1;
     if (ctx.*.param_arena_used + needed > PARAM_ARENA_SIZE) {
+        if (ctx.*.request) |r| {
+            const memory = core.ngx_pnalloc(r.*.pool, needed) orelse {
+                ctx.*.param_overflow = true;
+                return false;
+            };
+            const ptr: [*]u8 = @ptrCast(memory);
+            @memcpy(ptr[0..value.len], value);
+            ptr[value.len] = 0;
+            ctx.*.param_ptrs[ctx.*.param_count] = ptr;
+            ctx.*.param_count += 1;
+            return true;
+        }
         ctx.*.param_overflow = true;
         return false;
     }
@@ -707,7 +749,7 @@ fn parse_single_value_body(
 
 const PreferOptions = struct {
     params_single_object: bool = false,
-    return_mode: PreferReturnMode = .representation,
+    return_mode: PreferReturnMode = .minimal,
     handling: PreferHandling = .lenient,
     max_affected: ?usize = null,
     count_mode: PreferCountMode = .none,
@@ -952,7 +994,7 @@ fn parse_request_options(r: [*c]ngx_http_request_t) RequestOptions {
     var opts: RequestOptions = .{};
     opts.is_head = r != null and r.*.method == http.NGX_HTTP_HEAD;
     opts.prefer = parse_prefer_header(r);
-    opts.emit_range_headers = r != null and (r.*.method == http.NGX_HTTP_GET or r.*.method == http.NGX_HTTP_HEAD);
+    opts.emit_range_headers = r != null;
 
     if (extract_header_value(r, "accept")) |accept_val| {
         opts.singular_object = std.mem.containsAtLeast(u8, accept_val, 1, "application/vnd.pgrst.object+json");
@@ -1060,6 +1102,7 @@ fn build_rpc_table_count_query(
     function_name: []const u8,
     rpc_call: *const RpcCall,
     where_clause: []const u8,
+    params: ?*PgRequestCtx,
 ) usize {
     if (mode == .planned or mode == .estimated) {
         var inner_query_buf: [MAX_QUERY_SIZE]u8 = undefined;
@@ -1073,7 +1116,7 @@ fn build_rpc_table_count_query(
             "",
             &.{},
             .{ .limit = null, .offset = null },
-            null,
+            params,
         );
         return build_explain_query(query_buf, inner_query_buf[0..inner_query_len]);
     }
@@ -1088,7 +1131,7 @@ fn build_rpc_table_count_query(
         "",
         &.{},
         .{ .limit = null, .offset = null },
-        null,
+        params,
     );
 }
 
@@ -1195,7 +1238,7 @@ fn append_response_header(
     var headers = NList(ngx_table_elt_t).init0(&r.*.headers_out.headers);
     const h = headers.append() catch return false;
     h.*.hash = 1;
-    h.*.key = ngx_str_t{ .data = @constCast(key.ptr), .len = key.len };
+    h.*.key = dup_to_ngx_str(r.*.pool, key) orelse return false;
     h.*.value = dup_to_ngx_str(r.*.pool, value) orelse return false;
     h.*.lowcase_key = @constCast(lowcase_key.ptr);
     return true;
@@ -1220,7 +1263,8 @@ fn append_preference_applied_header(r: [*c]ngx_http_request_t, opts: RequestOpti
         pos += token.len;
     }
 
-    if (opts.prefer.return_mode != .representation) {
+    const requested_prefer = extract_header_value(r, "prefer") orelse "";
+    if (!is_rpc_endpoint(r.*.uri) and std.mem.indexOf(u8, requested_prefer, "return=") != null) {
         if (pos > 0) {
             buf_out[pos] = ',';
             pos += 1;
@@ -1293,11 +1337,14 @@ fn append_preference_applied_header(r: [*c]ngx_http_request_t, opts: RequestOpti
 
 fn append_range_headers(r: [*c]ngx_http_request_t, range_start: usize, ntuples: i32, total_count: ?i64, opts: RequestOptions) void {
     if (!opts.emit_range_headers) return;
+    if (!is_rpc_endpoint(r.*.uri) and r.*.method == http.NGX_HTTP_PUT) return;
+    if (has_response_header(r, "content-range")) return;
 
     _ = append_response_header(r, "Range-Unit", "range-unit", "items");
 
     var content_range_buf: [64]u8 = undefined;
-    const content_range = if (ntuples > 0) blk: {
+    const show_interval = is_rpc_endpoint(r.*.uri) or (r.*.method != http.NGX_HTTP_POST and r.*.method != http.NGX_HTTP_DELETE);
+    const content_range = if (ntuples > 0 and show_interval) blk: {
         const range_end = range_start + @as(usize, @intCast(ntuples - 1));
         break :blk if (total_count) |count|
             std.fmt.bufPrint(content_range_buf[0..], "{d}-{d}/{d}", .{ range_start, range_end, count }) catch return
@@ -1306,7 +1353,7 @@ fn append_range_headers(r: [*c]ngx_http_request_t, range_start: usize, ntuples: 
     } else if (total_count) |count|
         std.fmt.bufPrint(content_range_buf[0..], "*/{d}", .{count}) catch return
     else
-        std.fmt.bufPrint(content_range_buf[0..], "*/0", .{}) catch return;
+        std.fmt.bufPrint(content_range_buf[0..], "*/*", .{}) catch return;
 
     _ = append_response_header(r, "Content-Range", "content-range", content_range);
 }
@@ -1405,24 +1452,27 @@ fn should_reject_invalid_prefer(opts: RequestOptions) bool {
 }
 
 fn write_response_contract(sql_op: SqlOp, prefer: PreferOptions) WriteResponseContract {
-    const status = switch (sql_op) {
+    const status: ngx_uint_t = switch (sql_op) {
         .insert => @as(ngx_uint_t, 201),
-        .update, .delete => http.NGX_HTTP_OK,
+        .update, .delete => if (prefer.return_mode == .representation) @as(ngx_uint_t, http.NGX_HTTP_OK) else 204,
         else => http.NGX_HTTP_OK,
     };
 
     return .{
         .status = status,
         .send_body = prefer.return_mode == .representation,
-        .include_returning = prefer.return_mode == .representation or prefer.max_affected != null,
+        .include_returning = true,
     };
 }
 
 fn enforce_max_affected(r: [*c]ngx_http_request_t, opts: RequestOptions, ntuples: i32) ?ngx_int_t {
+    if (opts.prefer.handling != .strict) return null;
     const max_affected = opts.prefer.max_affected orelse return null;
     const affected: usize = @intCast(@max(ntuples, 0));
     if (affected > max_affected) {
-        return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Query exceeds Prefer: max-affected\"}");
+        var detail: [128]u8 = undefined;
+        const details = std.fmt.bufPrint(&detail, "The query affects {d} rows", .{affected}) catch unreachable;
+        return send_protocol_error(r, 400, "PGRST124", "Query result exceeds max-affected preference constraint", details, null);
     }
     return null;
 }
@@ -1441,8 +1491,8 @@ fn finalize_response_send(
 ) ngx_int_t {
     r.*.headers_out.status = read_response_status(status, range_start, ntuples, total_count, opts);
     const len = std.mem.len(content_type);
-    r.*.headers_out.content_type = ngx_str_t{ .data = @constCast(content_type), .len = len };
-    r.*.headers_out.content_type_len = len;
+    r.*.headers_out.content_type = ngx_str_t{ .data = @constCast(content_type), .len = if (send_body) len else 0 };
+    r.*.headers_out.content_type_len = if (send_body) len else 0;
     r.*.headers_out.content_length_n = if (send_body and !opts.is_head) @intCast(response_len) else 0;
 
     append_preference_applied_header(r, opts);
@@ -1547,9 +1597,49 @@ fn format_result_for_response(
     }
 }
 
+fn canonical_json_size(result: *PGresult, rows: i32, singular: bool) usize {
+    if (singular and rows == 0) return 4;
+    var size: usize = if (singular) 0 else 2;
+    var row: i32 = 0;
+    while (row < rows) : (row += 1) {
+        if (row > 0) size += 1;
+        size += if (pgGetisnull(result, row, 0) != 0) 4 else @as(usize, @intCast(pgGetlength(result, row, 0)));
+    }
+    return size;
+}
+
+fn format_canonical_json(result: *PGresult, rows: i32, storage: []u8, singular: bool) usize {
+    var pos: usize = 0;
+    if (!singular) {
+        storage[pos] = '[';
+        pos += 1;
+    }
+    var row: i32 = 0;
+    while (row < rows) : (row += 1) {
+        if (row > 0) {
+            storage[pos] = ',';
+            pos += 1;
+        }
+        const value = if (pgGetisnull(result, row, 0) != 0) "null" else pgGetvalue(result, row, 0)[0..@intCast(pgGetlength(result, row, 0))];
+        @memcpy(storage[pos..][0..value.len], value);
+        pos += value.len;
+    }
+    if (!singular) {
+        storage[pos] = ']';
+        pos += 1;
+    }
+    if (singular and rows == 0) {
+        @memcpy(storage[0..4], "null");
+        return 4;
+    }
+    return pos;
+}
+
 fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
     ctx.*.trace_release_calls += 1;
     trace_pool_event(ctx, ctx.*.pool_conn, if (failed) "release-failed" else "release");
+    if (ctx.*.wait_pool != null) unlink_pool_waiter(ctx);
+    release_request_hold(ctx);
     if (ctx.*.result != null) {
         pgClear(ctx.*.result);
         ctx.*.result = null;
@@ -1564,28 +1654,11 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
                 event.ngx_event_del_timer(ngx_conn.*.write);
             }
         }
-        // Release the count holds taken in start_pooled_request.  We use the
-        // stashed hold_main (set when the hold was taken) instead of ctx.request,
-        // because callers null ctx.request before reaching here.
-        //
-        // For subrequest holds, keep one hold so nginx's subrequest cleanup
-        // (r->main->count-- after the post_subrequest callback) can balance it
-        // — this preserves the 96632c3 guard against an NJS r.return() driving
-        // count to zero mid-stack and freeing main before nginx's decrement.
-        // For direct main-request holds there is no follow-up nginx decrement,
-        // so all holds must be released here or the request hangs at count > 0.
-        if (ctx.*.count_held > 0 and ctx.*.hold_main != core.nullptr(ngx_http_request_t)) {
-            const leak: usize = if (ctx.*.hold_is_subrequest) 1 else 0;
-            while (ctx.*.count_held > leak) {
-                ctx.*.hold_main.*.flags0.count -%= 1;
-                ctx.*.count_held -= 1;
-            }
-            if (!ctx.*.hold_is_subrequest) {
-                ctx.*.hold_main = core.nullptr(ngx_http_request_t);
-            }
-        }
         pool_conn.request_ctx = null;
-        if (failed) {
+        // A rejected response must never return an open/aborted transaction to
+        // the pool. Closing the socket rolls it back, including successful SQL
+        // whose HTTP representation failed validation.
+        if (failed or (pool_conn.conn != null and pq.pgTransactionStatus(pool_conn.conn.?) != pq.PQTRANS_IDLE)) {
             pool_conn.state = .conn_error;
         }
         pool_owner(pool_conn).releaseConn(pool_conn);
@@ -1688,6 +1761,140 @@ const FailureResponse = struct {
     body: []const u8,
 };
 
+fn json_error_body(r: [*c]ngx_http_request_t, code: []const u8, message: []const u8, details: ?[]const u8, hint: ?[]const u8) ?[]const u8 {
+    const capacity = 128 + 6 * (code.len + message.len + (if (details) |d| d.len else 0) + (if (hint) |h| h.len else 0));
+    const memory = core.ngx_pnalloc(r.*.pool, capacity) orelse return null;
+    const storage = @as([*]u8, @ptrCast(memory))[0..capacity];
+    var pos: usize = 0;
+    for ([_][]const u8{ "{\"code\":", ",\"message\":", ",\"details\":", ",\"hint\":" }, [_]?[]const u8{ code, message, details, hint }) |prefix, value| {
+        @memcpy(storage[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
+        if (value) |v| {
+            pos = append_json_quoted_string(storage, pos, v);
+        } else {
+            @memcpy(storage[pos..][0..4], "null");
+            pos += 4;
+        }
+    }
+    storage[pos] = '}';
+    return storage[0 .. pos + 1];
+}
+
+fn send_protocol_error(r: [*c]ngx_http_request_t, status: ngx_uint_t, code: []const u8, message: []const u8, details: ?[]const u8, hint: ?[]const u8) ngx_int_t {
+    return send_json_error(r, status, json_error_body(r, code, message, details, hint) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+}
+
+fn request_headers_json(r: [*c]ngx_http_request_t) ?[]const u8 {
+    var cj = CJSON.init(r.*.pool);
+    const root = cjson.cJSON_CreateObject(&cj.alloc) orelse return null;
+    // Subrequests share the main request's header list.
+    var headers = NList(ngx_table_elt_t).init0(&r.*.main.*.headers_in.headers);
+    var it = headers.iterator();
+    while (it.next()) |header| {
+        const key_memory = core.ngx_pnalloc(r.*.pool, header.*.key.len + 1) orelse return null;
+        const key: [*]u8 = @ptrCast(key_memory);
+        for (header.*.key.data[0..header.*.key.len], 0..) |ch, i| key[i] = std.ascii.toLower(ch);
+        key[header.*.key.len] = 0;
+        const val_memory = core.ngx_pnalloc(r.*.pool, header.*.value.len + 1) orelse return null;
+        const value: [*]u8 = @ptrCast(val_memory);
+        @memcpy(value[0..header.*.value.len], header.*.value.data[0..header.*.value.len]);
+        value[header.*.value.len] = 0;
+        if (cjson.cJSON_AddStringToObject(root, key, value, &cj.alloc) == null) return null;
+    }
+    const encoded = cj.encode(root) catch return null;
+    return encoded.data[0..encoded.len];
+}
+
+fn request_cookies_json(r: [*c]ngx_http_request_t) ?[]const u8 {
+    const input = extract_header_value(r, "cookie") orelse return "{}";
+    const capacity = 2 + 6 * input.len;
+    const memory = core.ngx_pnalloc(r.*.pool, capacity) orelse return null;
+    const storage = @as([*]u8, @ptrCast(memory))[0..capacity];
+    storage[0] = '{';
+    var pos: usize = 1;
+    var it = std.mem.splitScalar(u8, input, ';');
+    while (it.next()) |cookie| {
+        const pair = std.mem.trim(u8, cookie, " \t");
+        const equal = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (equal == 0) continue;
+        if (pos > 1) {
+            storage[pos] = ',';
+            pos += 1;
+        }
+        pos = append_json_quoted_string(storage, pos, pair[0..equal]);
+        storage[pos] = ':';
+        pos += 1;
+        pos = append_json_quoted_string(storage, pos, pair[equal + 1 ..]);
+    }
+    storage[pos] = '}';
+    return storage[0 .. pos + 1];
+}
+
+fn has_response_header(r: [*c]ngx_http_request_t, key: []const u8) bool {
+    var headers = NList(ngx_table_elt_t).init0(&r.*.headers_out.headers);
+    var it = headers.iterator();
+    while (it.next()) |h| if (h.*.hash != 0 and std.ascii.eqlIgnoreCase(h.*.key.data[0..h.*.key.len], key)) return true;
+    return false;
+}
+
+fn fail_response_settings(ctx: *PgRequestCtx, status_setting: bool) bool {
+    // 16.4 decodes these settings after the transaction commits. Preserve that
+    // externally observable effect; max-affected/singular validation still
+    // happens inside the transaction. Do not emit any partial custom headers.
+    ctx.*.response_settings_error = if (status_setting) .status else .headers;
+    ctx.*.response_headers = null;
+    return true;
+}
+
+fn read_response_settings(ctx: *PgRequestCtx, result: *PGresult) bool {
+    const r = ctx.*.request.?;
+    if (pgNtuples(result) != 1 or pgNfields(result) != 2) return fail_response_settings(ctx, false);
+    const status_text = std.mem.span(pgGetvalue(result, 0, 0));
+    if (status_text.len > 0) {
+        const value = std.fmt.parseInt(ngx_uint_t, status_text, 10) catch return fail_response_settings(ctx, true);
+        if (value < 100 or value > 599) return fail_response_settings(ctx, true);
+        ctx.*.response_override_status = value;
+    }
+    const header_text = std.mem.span(pgGetvalue(result, 0, 1));
+    if (header_text.len == 0) return true;
+    var cj = CJSON.init(r.*.pool);
+    const root = cj.decodeStrict(.{ .data = @constCast(header_text.ptr), .len = header_text.len }) catch return fail_response_settings(ctx, false);
+    if (cjson.cJSON_IsArray(root) != 1) return fail_response_settings(ctx, false);
+    var it = CJSON.Iterator.init(root);
+    // Validate everything before attaching any headers to an error response.
+    while (it.next()) |item| {
+        if (cjson.cJSON_IsObject(item) != 1 or cjson.cJSON_GetArraySize(item) != 1) return fail_response_settings(ctx, false);
+        const field = item.*.child;
+        if (cjson.cJSON_IsString(field) != 1 or field.*.string == null) return fail_response_settings(ctx, false);
+        const key = std.mem.span(field.*.string);
+        const value = std.mem.span(field.*.valuestring);
+        if (key.len == 0) return fail_response_settings(ctx, false);
+        for (key) |ch| if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", ch) == null) return fail_response_settings(ctx, false);
+        for (value) |ch| if (ch == '\r' or ch == '\n' or ch == 0) return fail_response_settings(ctx, false);
+    }
+    ctx.*.response_headers = root;
+    return true;
+}
+
+fn append_database_response_headers(ctx: *PgRequestCtx) bool {
+    const r = ctx.*.request.?;
+    if (ctx.*.response_headers == null) return true;
+    var it = CJSON.Iterator.init(ctx.*.response_headers);
+    while (it.next()) |item| {
+        const field = item.*.child;
+        const key = std.mem.span(field.*.string);
+        if (std.ascii.eqlIgnoreCase(key, "content-type")) {
+            ctx.*.response_content_type = @ptrCast(field.*.valuestring);
+            continue;
+        }
+        const lower = core.ngx_pnalloc(r.*.pool, key.len) orelse return false;
+        const lower_key = @as([*]u8, @ptrCast(lower))[0..key.len];
+        for (key, 0..) |ch, i| lower_key[i] = std.ascii.toLower(ch);
+        if (!append_response_header(r, key, lower_key, std.mem.span(field.*.valuestring))) return false;
+    }
+    return true;
+}
+
 fn contains_ascii_insensitive(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
@@ -1717,63 +1924,75 @@ fn classify_connection_error_message(message: []const u8) FailureResponse {
     return .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = "{\"message\":\"PostgreSQL connection failed\"}" };
 }
 
-fn application_error(sqlstate: []const u8) ?FailureResponse {
-    // Deliberately narrow application status contract. Never expose arbitrary
-    // PostgreSQL messages, DETAIL or HINT (which can contain row values).
-    const states = [_][]const u8{ "PT400", "PT401", "PT403", "PT404", "PT409", "PT422", "PT429", "PT503" };
-    const statuses = [_]ngx_uint_t{ 400, 401, 403, 404, 409, 422, 429, 503 };
-    for (states, statuses) |state, status| {
-        if (std.mem.eql(u8, sqlstate, state)) return .{ .status = status, .body = "{\"code\":\"application_rejected\"}" };
-    }
-    return null;
+fn classify_result_error(r: [*c]ngx_http_request_t, result: *PGresult) FailureResponse {
+    const code = result_error_field(result, PG_DIAG_SQLSTATE) orelse "";
+    const message = result_error_field(result, pq.PG_DIAG_MESSAGE_PRIMARY) orelse "PostgreSQL query failed";
+    if (std.mem.eql(u8, code, "PGRST")) return raised_protocol_error(r, message, result_error_field(result, pq.PG_DIAG_MESSAGE_DETAIL));
+    return .{
+        .status = @import("pgrest_protocol.zig").sql_status(code, message, extract_jwt_token(r) != null),
+        .body = json_error_body(r, code, message, result_error_field(result, pq.PG_DIAG_MESSAGE_DETAIL), result_error_field(result, pq.PG_DIAG_MESSAGE_HINT)) orelse "{}",
+    };
 }
 
-fn classify_result_error(result: *PGresult) FailureResponse {
-    const sqlstate_ptr = pgResultErrorField(result, PG_DIAG_SQLSTATE);
-    const sqlstate = if (sqlstate_ptr != null) std.mem.span(sqlstate_ptr) else "";
-    if (application_error(sqlstate)) |failure| return failure;
-    if (std.mem.startsWith(u8, sqlstate, "22")) return .{ .status = 400, .body = "{\"code\":\"invalid_input\"}" };
-    if (std.mem.eql(u8, sqlstate, "42601")) {
-        return .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = "{\"message\":\"SQL syntax error\"}" };
-    }
-    if (std.mem.eql(u8, sqlstate, "42P01")) {
-        return .{ .status = http.NGX_HTTP_NOT_FOUND, .body = "{\"message\":\"Undefined table\"}" };
-    }
-    if (std.mem.eql(u8, sqlstate, "42883")) {
-        return .{ .status = http.NGX_HTTP_NOT_FOUND, .body = "{\"message\":\"Undefined function\"}" };
-    }
-    if (std.mem.eql(u8, sqlstate, "42501")) {
-        return .{ .status = http.NGX_HTTP_FORBIDDEN, .body = "{\"message\":\"Insufficient privileges\"}" };
-    }
-    if (std.mem.startsWith(u8, sqlstate, "23")) {
-        return .{ .status = 409, .body = "{\"message\":\"Constraint violation\"}" };
-    }
-    if (std.mem.startsWith(u8, sqlstate, "08")) {
-        return .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = "{\"message\":\"PostgreSQL connection failed\"}" };
-    }
+fn json_string_member(object: [*c]cjson.cJSON, key: [*:0]const u8) ?[]const u8 {
+    const value = CJSON.stringValue(cjson.cJSON_GetObjectItemCaseSensitive(object, key)) orelse return null;
+    return value.data[0..value.len];
+}
 
-    const message_ptr = pgResultErrorMessage(result);
-    const message = if (message_ptr != null) std.mem.span(message_ptr) else "";
-    if (contains_ascii_insensitive(message, "syntax error")) {
-        return .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = "{\"message\":\"SQL syntax error\"}" };
+fn invalid_raised_error(r: [*c]ngx_http_request_t, kind: enum { message, detail, missing }, text: []const u8) FailureResponse {
+    const prefix = if (kind == .message) "Invalid JSON value for MESSAGE: '" else "Invalid JSON value for DETAIL: '";
+    const memory = core.ngx_pnalloc(r.*.pool, prefix.len + text.len + 1) orelse return .{ .status = 500, .body = "{}" };
+    const detail = @as([*]u8, @ptrCast(memory))[0 .. prefix.len + text.len + 1];
+    @memcpy(detail[0..prefix.len], prefix);
+    @memcpy(detail[prefix.len..][0..text.len], text);
+    detail[detail.len - 1] = '\'';
+    return .{ .status = 500, .body = json_error_body(r, "PGRST121", "Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error", if (kind == .missing) "DETAIL is missing in the RAISE statement" else detail, if (kind == .message) "MESSAGE must be a JSON object with obligatory keys: 'code', 'message' and optional keys: 'details', 'hint'." else "DETAIL must be a JSON object with obligatory keys: 'status', 'headers' and optional key: 'status_text'.") orelse "{}" };
+}
+
+fn raised_protocol_error(r: [*c]ngx_http_request_t, message: []const u8, details: ?[]const u8) FailureResponse {
+    var cj = CJSON.init(r.*.pool);
+    const msg = cj.decodeDocument(.{ .data = @constCast(message.ptr), .len = message.len }) catch return invalid_raised_error(r, .message, message);
+    if (cjson.cJSON_IsObject(msg) != 1) return invalid_raised_error(r, .message, message);
+    const code = json_string_member(msg, "code") orelse return invalid_raised_error(r, .message, message);
+    const text = json_string_member(msg, "message") orelse return invalid_raised_error(r, .message, message);
+    for ([_][*:0]const u8{ "details", "hint" }) |key| {
+        const field = cjson.cJSON_GetObjectItemCaseSensitive(msg, key);
+        if (field != null and cjson.cJSON_IsString(field) != 1 and cjson.cJSON_IsNull(field) != 1) return invalid_raised_error(r, .message, message);
     }
-    if (contains_ascii_insensitive(message, "does not exist")) {
-        if (contains_ascii_insensitive(message, "function")) {
-            return .{ .status = http.NGX_HTTP_NOT_FOUND, .body = "{\"message\":\"Undefined function\"}" };
-        }
-        if (contains_ascii_insensitive(message, "relation")) {
-            return .{ .status = http.NGX_HTTP_NOT_FOUND, .body = "{\"message\":\"Undefined table\"}" };
-        }
+    const detail = details orelse return invalid_raised_error(r, .missing, "");
+    const config = cj.decodeDocument(.{ .data = @constCast(detail.ptr), .len = detail.len }) catch return invalid_raised_error(r, .detail, detail);
+    if (cjson.cJSON_IsObject(config) != 1) return invalid_raised_error(r, .detail, detail);
+    const status = CJSON.floatValue(cjson.cJSON_GetObjectItemCaseSensitive(config, "status")) orelse return invalid_raised_error(r, .detail, detail);
+    if (status < 100 or status > 599 or @floor(status) != status) return invalid_raised_error(r, .detail, detail);
+    const headers = cjson.cJSON_GetObjectItemCaseSensitive(config, "headers");
+    if (cjson.cJSON_IsObject(headers) != 1) return invalid_raised_error(r, .detail, detail);
+    var it = CJSON.Iterator.init(headers);
+    while (it.next()) |field| {
+        if (cjson.cJSON_IsString(field) != 1) return invalid_raised_error(r, .detail, detail);
+        const key = std.mem.span(field.*.string);
+        if (key.len == 0) return invalid_raised_error(r, .detail, detail);
+        for (key) |ch| if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", ch) == null) return invalid_raised_error(r, .detail, detail);
+        for (std.mem.span(field.*.valuestring)) |ch| if (ch == '\r' or ch == '\n') return invalid_raised_error(r, .detail, detail);
     }
-    if (contains_ascii_insensitive(message, "permission denied")) {
-        return .{ .status = http.NGX_HTTP_FORBIDDEN, .body = "{\"message\":\"Insufficient privileges\"}" };
+    it = CJSON.Iterator.init(headers);
+    while (it.next()) |field| {
+        const key = std.mem.span(field.*.string);
+        const memory = core.ngx_pnalloc(r.*.pool, key.len) orelse return .{ .status = 500, .body = "{}" };
+        const lower = @as([*]u8, @ptrCast(memory))[0..key.len];
+        for (key, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
+        _ = append_response_header(r, key, lower, std.mem.span(field.*.valuestring));
     }
-    return .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = "{\"message\":\"PostgreSQL query failed\"}" };
+    return .{ .status = @intFromFloat(status), .body = json_error_body(r, code, text, json_string_member(msg, "details"), json_string_member(msg, "hint")) orelse "{}" };
+}
+
+fn result_error_field(result: *PGresult, field: c_int) ?[]const u8 {
+    const value = pgResultErrorField(result, field);
+    return if (value != null) std.mem.span(value) else null;
 }
 
 fn classify_pooled_failure(ctx: *PgRequestCtx) FailureResponse {
     if (ctx.*.result) |result| {
-        return classify_result_error(result);
+        return classify_result_error(ctx.*.request.?, result);
     }
     if (ctx.*.pool_conn) |pool_conn| {
         if (pool_conn.conn) |conn| {
@@ -1903,11 +2122,39 @@ fn queue_jwt_setup_queries(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t)
         role_to_set = anon_role;
     }
 
-    // Build a single combined multi-statement query instead of enqueueing
-    // separate RESET ROLE, SET request.jwt, and SET ROLE commands.
+    // All request settings are local to ONE transaction. Never expose success
+    // until representation checks and COMMIT (including deferred constraints)
+    // complete. A failed request discards the connection, rolling it back.
     var combined_buf: [MAX_QUERY_SIZE]u8 = undefined;
-    const combined_len = pgrest_auth.build_combined_jwt_setup_query(&combined_buf, jwt_token, role_to_set) orelse return .failed;
-    if (!set_active_query(ctx, combined_buf[0..combined_len])) return .failed;
+    const begin = if (ctx.*.transaction_read_only or r.*.method == http.NGX_HTTP_GET or r.*.method == http.NGX_HTTP_HEAD)
+        "BEGIN READ ONLY; "
+    else
+        "BEGIN READ WRITE; ";
+    @memcpy(combined_buf[0..begin.len], begin);
+    var pos = pgrest_auth.append_setting(&combined_buf, begin.len, "SET LOCAL request.jwt TO ", jwt_token orelse "") orelse return .failed;
+    var claims: [4096]u8 = undefined;
+    var claims_json: []const u8 = "{}";
+    if (jwt_token) |token| {
+        if (secret.len > 0) {
+            var parts = std.mem.splitScalar(u8, token, '.');
+            _ = parts.next();
+            const payload = parts.next() orelse return .failed;
+            const length = pgrest_auth.base64url_decode(payload, &claims) orelse return .failed;
+            claims_json = claims[0..length];
+        }
+    }
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL request.jwt.claims TO ", claims_json) orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL request.method TO ", core.slicify(u8, r.*.method_name.data, r.*.method_name.len)) orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL request.path TO ", core.slicify(u8, r.*.uri.data, r.*.uri.len)) orelse return .failed;
+    const headers = request_headers_json(r) orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL request.headers TO ", headers) orelse return .failed;
+    const cookies = request_cookies_json(r) orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL request.cookies TO ", cookies) orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL response.status TO ", "") orelse return .failed;
+    pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL response.headers TO ", "") orelse return .failed;
+    if (role_to_set) |role| pos = pgrest_auth.append_setting(&combined_buf, pos, "; SET LOCAL ROLE ", role) orelse return .failed;
+    if (!set_active_query(ctx, combined_buf[0..pos])) return .failed;
+    ctx.*.transaction_phase = .setup;
 
     return .ok;
 }
@@ -1915,13 +2162,45 @@ fn queue_jwt_setup_queries(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t)
 fn start_pooled_query(ctx: *PgRequestCtx, pool_conn: *PgPoolConn) bool {
     const conn = pool_conn.conn orelse return false;
 
+    // PostgreSQL owns type-aware JSON conversion (including domains, arrays,
+    // composites and exact numeric values). One output row per affected row
+    // preserves range, singular and max-affected validation before COMMIT.
+    if (ctx.*.transaction_phase == .active and ctx.*.rpc_phase == .call and ctx.*.response_format == .json and ctx.*.inline_count) {
+        if (!wrap_counted_query(ctx)) return false;
+        ctx.*.canonical_json = true;
+    } else if (ctx.*.transaction_phase == .active and ctx.*.rpc_phase == .call and ctx.*.response_format == .json) {
+        const r = ctx.*.request.?;
+        var wrapped: [MAX_QUERY_SIZE]u8 = undefined;
+        const prefix = "WITH pgrst_source AS (";
+        const suffix = ") SELECT ";
+        if (ctx.*.query_len + 256 >= wrapped.len) return false;
+        @memcpy(wrapped[0..prefix.len], prefix);
+        var pos = prefix.len;
+        @memcpy(wrapped[pos..][0..ctx.*.query_len], ctx.*.query[0..ctx.*.query_len]);
+        pos += ctx.*.query_len;
+        @memcpy(wrapped[pos..][0..suffix.len], suffix);
+        pos += suffix.len;
+        const conversion = if (ctx.*.strip_nulls) "jsonb_strip_nulls(to_jsonb(pgrst_source))" else "to_jsonb(pgrst_source)";
+        @memcpy(wrapped[pos..][0..conversion.len], conversion);
+        pos += conversion.len;
+        if (ctx.*.rpc_scalar) {
+            @memcpy(wrapped[pos..][0..2], "->");
+            pos = append_sql_quoted(&wrapped, pos + 2, extract_rpc_function_name(r.*.uri) orelse return false);
+        }
+        const from = " AS pgrst_json FROM pgrst_source";
+        @memcpy(wrapped[pos..][0..from.len], from);
+        pos += from.len;
+        if (!set_active_query(ctx, wrapped[0..pos])) return false;
+        ctx.*.canonical_json = true;
+    }
+
     if (ctx.*.result != null) {
         pgClear(ctx.*.result);
         ctx.*.result = null;
     }
 
     const query_slice = std.mem.sliceTo(&ctx.*.query, 0);
-    const use_params = ctx.*.param_count > 0 and !ctx.*.param_overflow and
+    const use_params = ctx.*.transaction_phase == .active and ctx.*.param_count > 0 and !ctx.*.param_overflow and
         std.mem.indexOfScalar(u8, query_slice, '$') != null;
     const query_sent = if (use_params)
         pgSendQueryParams(conn, &ctx.*.query, @intCast(ctx.*.param_count), null, @ptrCast(&ctx.*.param_ptrs), null, null, 0)
@@ -1945,6 +2224,41 @@ fn start_pooled_query(ctx: *PgRequestCtx, pool_conn: *PgPoolConn) bool {
     return true;
 }
 
+fn wrap_counted_query(ctx: *PgRequestCtx) bool {
+    // A VOLATILE RPC must run once even when count and pagination are requested.
+    // Materialize its result, then derive both body and count from that result.
+    var wrapped: [MAX_QUERY_SIZE]u8 = undefined;
+    const prefix = "WITH pgrst_source AS MATERIALIZED (";
+    if (ctx.*.query_len + 1024 > wrapped.len) return false;
+    @memcpy(wrapped[0..prefix.len], prefix);
+    var pos = prefix.len;
+    @memcpy(wrapped[pos..][0..ctx.*.query_len], ctx.*.query[0..ctx.*.query_len]);
+    pos += ctx.*.query_len;
+    const page = "), pgrst_page AS MATERIALIZED (TABLE pgrst_source";
+    @memcpy(wrapped[pos..][0..page.len], page);
+    pos += page.len;
+    if (ctx.*.has_page_limit) pos += (std.fmt.bufPrint(wrapped[pos..], " LIMIT {d}", .{ctx.*.page_limit}) catch return false).len;
+    pos += (std.fmt.bufPrint(wrapped[pos..], " OFFSET {d}) SELECT (SELECT coalesce(jsonb_agg(", .{ctx.*.response_range_start}) catch return false).len;
+    const conversion = if (ctx.*.strip_nulls) "jsonb_strip_nulls(to_jsonb(pgrst_page))" else "to_jsonb(pgrst_page)";
+    @memcpy(wrapped[pos..][0..conversion.len], conversion);
+    pos += conversion.len;
+    if (ctx.*.rpc_scalar) {
+        @memcpy(wrapped[pos..][0..2], "->");
+        pos = append_sql_quoted(&wrapped, pos + 2, extract_rpc_function_name(ctx.*.request.?.*.uri).?);
+    }
+    const aggregate = "),'[]'::jsonb)";
+    @memcpy(wrapped[pos..][0..aggregate.len], aggregate);
+    pos += aggregate.len;
+    if (ctx.*.singular_object or (ctx.*.rpc_scalar and !ctx.*.rpc_setof)) {
+        @memcpy(wrapped[pos..][0..3], "->0");
+        pos += 3;
+    }
+    const suffix = " FROM pgrst_page), (SELECT count(*) FROM pgrst_page), (SELECT count(*) FROM pgrst_source)";
+    @memcpy(wrapped[pos..][0..suffix.len], suffix);
+    pos += suffix.len;
+    return set_active_query(ctx, wrapped[0..pos]);
+}
+
 fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ngx_int_t {
     const conninfo = core.slicify(u8, loc_conf.*.conninfo.data, loc_conf.*.conninfo.len);
     const max_conn: usize = if (loc_conf.*.pool_size > 0)
@@ -1966,6 +2280,10 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     ctx.*.trace_last_event_len = 0;
     trace_pool_event(ctx, null, "request-start");
 
+    // New arrivals cannot bypass an older waiter, even if a release has posted
+    // its wake-up but nginx has not dispatched that event yet.
+    if (conn_pool.wait_head != null and ctx.*.count_held == 0) return enqueue_pool_waiter(ctx, conn_pool, loc_conf);
+
     while (conn_pool.getIdleConn()) |pool_conn| {
         trace_pool_event(ctx, pool_conn, "idle-found");
         if (!is_pool_conn_reusable(pool_conn)) {
@@ -1986,15 +2304,11 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
             ctx.*.pool_conn = null;
             return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-        const r = ctx.*.request.?;
-        ctx.*.hold_main = r.*.main;
-        ctx.*.hold_is_subrequest = (r != r.*.main);
-        r.*.main.*.flags0.count +%= 1;
-        ctx.*.count_held += 1;
+        hold_pooled_request(ctx);
         return core.NGX_DONE;
     }
 
-    const pool_conn = conn_pool.getFreeSlot() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
+    const pool_conn = conn_pool.getFreeSlot() orelse return enqueue_pool_waiter(ctx, conn_pool, loc_conf);
     trace_pool_event(ctx, pool_conn, "free-slot");
     const conn = pgConnectStart(&conn_pool.conninfo);
     if (conn == null) return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2058,16 +2372,88 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         }
     }
 
-    {
-        const r = ctx.*.request.?;
-        ctx.*.hold_main = r.*.main;
-        ctx.*.hold_is_subrequest = (r != r.*.main);
-        r.*.main.*.flags0.count +%= 1;
-        ctx.*.count_held += 1;
-    }
+    hold_pooled_request(ctx);
     trace_pool_event(ctx, pool_conn, "connect-start");
     poll_pg_connection(ctx, pool_conn);
     return core.NGX_DONE;
+}
+
+fn hold_pooled_request(ctx: *PgRequestCtx) void {
+    if (ctx.*.count_held != 0) return;
+    const r = ctx.*.request.?;
+    ctx.*.hold_main = r.*.main;
+    ctx.*.hold_is_subrequest = r != r.*.main;
+    r.*.main.*.flags0.count +%= 1;
+    ctx.*.count_held = 1;
+}
+
+fn release_request_hold(ctx: *PgRequestCtx) void {
+    // Preserve the final subrequest hold for nginx's own post-subrequest
+    // decrement. Main requests, including queue timeouts, release their hold.
+    const retained: usize = if (ctx.*.hold_is_subrequest) 1 else 0;
+    while (ctx.*.count_held > retained and ctx.*.hold_main != null) {
+        ctx.*.hold_main.*.flags0.count -%= 1;
+        ctx.*.count_held -= 1;
+    }
+    if (!ctx.*.hold_is_subrequest) ctx.*.hold_main = null;
+}
+
+fn wake_pool_waiter(pool: *PgConnPool) void {
+    const first = pool.wait_head orelse return;
+    if (pool.getIdleConn() == null and pool.getFreeSlot() == null) return;
+    event.ngz_post_event(&first.*.wait_event);
+}
+
+fn unlink_pool_waiter(ctx: *PgRequestCtx) void {
+    const pool = ctx.*.wait_pool orelse return;
+    if (ctx.*.wait_previous) |previous| previous.*.wait_next = ctx.*.wait_next else pool.wait_head = ctx.*.wait_next;
+    if (ctx.*.wait_next) |next| next.*.wait_previous = ctx.*.wait_previous else pool.wait_tail = ctx.*.wait_previous;
+    pool.wait_count -= 1;
+    ctx.*.wait_pool = null;
+    ctx.*.wait_previous = null;
+    ctx.*.wait_next = null;
+    if (ctx.*.wait_event.flags.timer_set) event.ngx_event_del_timer(&ctx.*.wait_event);
+    event.ngz_delete_posted_event(&ctx.*.wait_event);
+}
+
+fn pool_acquisition_error(r: [*c]ngx_http_request_t) ngx_int_t {
+    return send_protocol_error(r, 504, "PGRST003", "Timed out acquiring connection from connection pool.", null, null);
+}
+
+fn enqueue_pool_waiter(ctx: *PgRequestCtx, pool: *PgConnPool, lc: *ngx_pgrest_loc_conf_t) ngx_int_t {
+    const limit: usize = @intCast(@max(lc.*.pool_queue_size, 0));
+    if (pool.wait_count >= limit or lc.*.pool_acquisition_timeout == 0) return pool_acquisition_error(ctx.*.request.?);
+    ctx.*.wait_pool = pool;
+    ctx.*.wait_previous = pool.wait_tail;
+    ctx.*.wait_next = null;
+    if (pool.wait_tail) |tail| tail.*.wait_next = ctx else pool.wait_head = ctx;
+    pool.wait_tail = ctx;
+    pool.wait_count += 1;
+    ctx.*.wait_event = std.mem.zeroes(ngx_event_t);
+    ctx.*.wait_event.data = ctx;
+    ctx.*.wait_event.handler = pool_wait_handler;
+    ctx.*.wait_event.log = http.ngx_cycle.*.log;
+    hold_pooled_request(ctx);
+    event.ngx_event_add_timer(&ctx.*.wait_event, lc.*.pool_acquisition_timeout);
+    wake_pool_waiter(pool);
+    return core.NGX_DONE;
+}
+
+fn pool_wait_handler(ev: [*c]ngx_event_t) callconv(.c) void {
+    const ctx = core.castPtr(PgRequestCtx, ev.*.data) orelse return;
+    const r = ctx.*.request orelse return;
+    const expired = ev.*.flags.timedout;
+    const pool = ctx.*.wait_pool.?;
+    unlink_pool_waiter(ctx);
+    const lc = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module)).?;
+    const rc = if (expired) pool_acquisition_error(r) else if (r.*.connection.*.flags.@"error") core.NGX_ERROR else start_pooled_request(ctx, lc);
+    wake_pool_waiter(pool);
+    if (rc == core.NGX_DONE) return;
+    ctx.*.request = null;
+    release_pooled_ctx(ctx, true);
+    const connection = r.*.connection;
+    http.ngx_http_finalize_request(r, rc);
+    http.ngx_http_run_posted_requests(connection);
 }
 
 fn column_is_raw_json(raw_json_fields: []const [64]u8, raw_json_field_lens: []const usize, raw_json_field_count: usize, name: []const u8) bool {
@@ -2119,7 +2505,7 @@ fn build_json_column_meta(
 
 fn needs_json_escape(value: []const u8) bool {
     for (value) |c| {
-        if (c == '"' or c == '\\' or c == '\n' or c == '\r' or c == '\t') return true;
+        if (c == '"' or c == '\\' or c < 0x20) return true;
     }
     return false;
 }
@@ -2169,6 +2555,14 @@ fn append_json_quoted_string(json_buf: []u8, pos_in: usize, value: []const u8) u
                 json_buf[pos + 1] = 't';
                 pos += 2;
             },
+            0...8, 11...12, 14...31 => {
+                if (pos + 6 > json_buf.len) break;
+                const hex = "0123456789abcdef";
+                @memcpy(json_buf[pos..][0..4], "\\u00");
+                json_buf[pos + 4] = hex[c >> 4];
+                json_buf[pos + 5] = hex[c & 15];
+                pos += 6;
+            },
             else => {
                 if (pos >= json_buf.len) break;
                 json_buf[pos] = c;
@@ -2189,6 +2583,7 @@ fn estimated_json_string_size(value: []const u8) usize {
     for (value) |c| {
         size += switch (c) {
             '"', '\\', '\n', '\r', '\t' => 2,
+            0...8, 11...12, 14...31 => 6,
             else => 1,
         };
     }
@@ -2595,6 +2990,8 @@ fn pgrest_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         loc.*.json_scalar_max_size = conf.NGX_CONF_UNSET_SIZE;
         loc.*.pool_size = NGX_CONF_UNSET;
         loc.*.timeout = conf.NGX_CONF_UNSET_MSEC;
+        loc.*.pool_acquisition_timeout = conf.NGX_CONF_UNSET_MSEC;
+        loc.*.pool_queue_size = NGX_CONF_UNSET;
         return loc;
     }
     return null;
@@ -2616,7 +3013,10 @@ fn pgrest_merge_loc_conf(
         cur.*.jwt_role_claim = prev.*.jwt_role_claim;
         cur.*.jwt_role_claim_explicit = prev.*.jwt_role_claim_explicit;
     }
-    if (cur.*.json_scalar == NGX_CONF_UNSET) cur.*.json_scalar = if (prev.*.json_scalar == NGX_CONF_UNSET) 0 else prev.*.json_scalar;
+    if (cur.*.json_scalar == NGX_CONF_UNSET) cur.*.json_scalar = if (prev.*.json_scalar == NGX_CONF_UNSET) 1 else prev.*.json_scalar;
+    if (cur.*.pool_acquisition_timeout == conf.NGX_CONF_UNSET_MSEC) cur.*.pool_acquisition_timeout = if (prev.*.pool_acquisition_timeout == conf.NGX_CONF_UNSET_MSEC) 10000 else prev.*.pool_acquisition_timeout;
+    if (cur.*.pool_queue_size == NGX_CONF_UNSET) cur.*.pool_queue_size = if (prev.*.pool_queue_size == NGX_CONF_UNSET) 128 else prev.*.pool_queue_size;
+    if (cur.*.pool_queue_size < 0 or cur.*.pool_queue_size > 4096) return core.c_str("pgrest_pool_queue_size must be between 0 and 4096");
     if (cur.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) cur.*.json_scalar_max_size =
         if (prev.*.json_scalar_max_size == conf.NGX_CONF_UNSET_SIZE) MAX_JSON_SIZE else prev.*.json_scalar_max_size;
     if (cur.*.json_scalar_max_size < MIN_RESPONSE_BUFFER_SIZE or cur.*.json_scalar_max_size > MAX_JSON_SCALAR_SIZE) {
@@ -2781,7 +3181,7 @@ const SqlOp = enum {
 };
 
 /// Maximum SQL query buffer size
-const MAX_QUERY_SIZE = 4096;
+const MAX_QUERY_SIZE = 16384;
 
 /// Build SQL query from request components
 /// Returns the length of the query written to the buffer
@@ -5579,22 +5979,27 @@ fn format_result_as_object(
 /// RPC (Remote Procedure Call) - Stored Procedure Support
 /// ============================================================================
 /// Maximum number of RPC parameters
-const MAX_RPC_PARAMS = 16;
+const MAX_RPC_PARAMS = 100;
 
 /// RPC parameter for function call
 const RpcParam = struct {
     name: []const u8,
     value: []const u8,
+    name_buf: [128]u8 = undefined,
     is_null: bool = false,
     is_numeric: bool = false,
     is_boolean: bool = false,
     is_raw: bool = false,
     is_variadic: bool = false,
-    value_buf: [2048]u8 = std.mem.zeroes([2048]u8),
+    json_body: bool = false,
+    type_len: usize = 0,
+    type_buf: [256]u8 = undefined,
+    value_buf: [256]u8 = undefined,
 };
 
 /// Parsed RPC call information
 const RpcCall = struct {
+    pool: [*c]ngx_pool_t = null,
     function_name: []const u8,
     params: [MAX_RPC_PARAMS]RpcParam,
     param_count: usize,
@@ -5632,8 +6037,12 @@ const RpcMetadata = struct {
     variadic_param_name_len: usize = 0,
     variadic_param_name_buf: [128]u8 = std.mem.zeroes([128]u8),
     input_param_names_len: usize = 0,
-    input_param_names_buf: [256]u8 = std.mem.zeroes([256]u8),
+    input_param_names_buf: [8192]u8 = std.mem.zeroes([8192]u8),
     found: bool = false,
+    returns_set: bool = false,
+    returns_void: bool = false,
+    ambiguous: bool = false,
+    input_types: []const u8 = "",
 };
 
 fn rpc_variadic_param_name(metadata: *const RpcMetadata) []const u8 {
@@ -5661,10 +6070,7 @@ fn rpc_params_match_metadata(call: *const RpcCall, metadata: *const RpcMetadata)
         } else if (!rpc_metadata_has_named_param(metadata, param.name)) {
             return false;
         }
-        for (call.params[0..i]) |previous| {
-            if (std.mem.eql(u8, previous.name, param.name) and
-                !(metadata.has_variadic and std.mem.eql(u8, param.name, rpc_variadic_param_name(metadata)))) return false;
-        }
+        _ = i;
     }
     return true;
 }
@@ -5681,12 +6087,90 @@ fn rpc_unique_param_count(call: *const RpcCall) usize {
     return count;
 }
 
+fn rpc_parameter_shadowed(call: *const RpcCall, index: usize) bool {
+    const param = call.params[index];
+    if (param.is_variadic) return false;
+    for (call.params[index + 1 .. call.param_count]) |later| if (std.mem.eql(u8, param.name, later.name)) return true;
+    return false;
+}
+
+fn rpc_parameter_index(call: *const RpcCall, position: usize) usize {
+    // PostgreSQL requires the VARIADIC expression to be last, even for named
+    // notation. HTTP query order must not affect whether the call is valid.
+    var seen: usize = 0;
+    for ([_]bool{ false, true }) |variadic| {
+        for (call.params[0..call.param_count], 0..) |param, i| {
+            if (param.is_variadic != variadic) continue;
+            if (seen == position) return i;
+            seen += 1;
+        }
+    }
+    unreachable;
+}
+
+fn copy_rpc_param(destination: *RpcParam, source: *const RpcParam) void {
+    const start = @intFromPtr(source);
+    const end = start + @sizeOf(RpcParam);
+    const name = @intFromPtr(source.name.ptr);
+    const value = @intFromPtr(source.value.ptr);
+    destination.* = source.*;
+    const bytes = std.mem.asBytes(destination);
+    if (name >= start and name < end) destination.name = bytes[name - start ..][0..source.name.len];
+    if (value >= start and value < end) destination.value = bytes[value - start ..][0..source.value.len];
+}
+
+fn apply_rpc_argument_types(pool: [*c]ngx_pool_t, call: *RpcCall, metadata: *const RpcMetadata) bool {
+    if (metadata.input_types.len == 0) return true;
+    var cj = CJSON.init(pool);
+    const types = cj.decode(.{ .data = @constCast(metadata.input_types.ptr), .len = metadata.input_types.len }) catch return false;
+    for (call.params[0..call.param_count]) |*param| {
+        var it = CJSON.Iterator.init(types);
+        while (it.next()) |field| {
+            if (!std.mem.eql(u8, param.name, std.mem.span(field.*.string))) continue;
+            const value = CJSON.stringValue(field) orelse return false;
+            if (value.len > param.type_buf.len) return false;
+            @memcpy(param.type_buf[0..value.len], value.data[0..value.len]);
+            param.type_len = value.len;
+        }
+        if (param.json_body and param.type_len == 0) return false;
+    }
+    return true;
+}
+
+fn append_rpc_json_argument(out: []u8, start: usize, param: RpcParam, params: ?*PgRequestCtx) usize {
+    const prefix = "(SELECT x.";
+    @memcpy(out[start..][0..prefix.len], prefix);
+    var pos = pgrest_sql.append_identifier(out, start + prefix.len, param.name);
+    const from = " FROM json_to_record(";
+    @memcpy(out[pos..][0..from.len], from);
+    pos += from.len;
+    if (params) |ctx| {
+        if (ctx.*.rpc_body_param_index == 0) {
+            pos = append_param_or_quoted(out, pos, param.value, params);
+            ctx.*.rpc_body_param_index = ctx.*.param_count;
+        } else {
+            pos += (std.fmt.bufPrint(out[pos..], "${d}", .{ctx.*.rpc_body_param_index}) catch return pos).len;
+        }
+    } else pos = append_param_or_quoted(out, pos, param.value, null);
+    const record = "::json) AS x(";
+    @memcpy(out[pos..][0..record.len], record);
+    pos += record.len;
+    pos = pgrest_sql.append_identifier(out, pos, param.name);
+    out[pos] = ' ';
+    pos += 1;
+    @memcpy(out[pos..][0..param.type_len], param.type_buf[0..param.type_len]);
+    pos += param.type_len;
+    @memcpy(out[pos..][0..2], "))");
+    return pos + 2;
+}
+
 fn rpc_query_fits(schema: ?[]const u8, function: []const u8, call: *const RpcCall) bool {
     // Values bound by libpq only need a placeholder. Generated ARRAY syntax
     // remains inline and identifiers can expand when double quotes are escaped.
     var needed: usize = 32 + 2 * function.len + 2 * (if (schema) |s| s.len else @as(usize, 0));
     for (call.params[0..call.param_count]) |param| {
         needed += 2 * param.name.len + 12;
+        if (param.json_body) needed += 4 * param.name.len + param.type_len + 80;
         needed += if (param.is_raw or param.is_numeric or param.is_boolean) param.value.len else 8;
         if (needed >= MAX_QUERY_SIZE) return false;
     }
@@ -5722,8 +6206,9 @@ fn rpc_allow_single_unnamed_fallback(body_format: RequestBodyFormat, prefer_sing
 }
 
 fn rpc_method_allowed(method: ngx_uint_t, metadata: RpcMetadata) bool {
+    _ = metadata;
     return switch (method) {
-        http.NGX_HTTP_GET, http.NGX_HTTP_HEAD => metadata.volatility != .volatile_fn,
+        http.NGX_HTTP_GET, http.NGX_HTTP_HEAD => true,
         http.NGX_HTTP_POST => true,
         else => false,
     };
@@ -5737,47 +6222,48 @@ fn rpc_allow_header(metadata: RpcMetadata) []const u8 {
 }
 
 fn rpc_returns_table_like(metadata: RpcMetadata) bool {
-    return metadata.return_kind == .composite_single or metadata.return_kind == .composite_setof;
+    return metadata.return_kind == .composite_single or metadata.return_kind == .composite_setof or metadata.returns_set;
 }
 
 fn build_rpc_metadata_query(
     query_buf: []u8,
     schema_name: ?[]const u8,
     function_name: []const u8,
-    requested_param_count: usize,
+    call: *const RpcCall,
     allow_single_unnamed_fallback: bool,
 ) usize {
-    var pos: usize = 0;
-    const prefix =
-        "SELECT p.provolatile, p.proretset, (t.typtype = 'c' OR COALESCE(p.proargmodes::text[] && '{t,b,o}', false)) AS rettype_is_composite, p.provariadic > 0 AS has_variadic, COALESCE(meta.unnamed_count, 0), COALESCE(meta.single_unnamed_kind, ''), COALESCE(meta.variadic_param_name, ''), COALESCE(meta.input_param_names, ''), CASE WHEN ";
-    @memcpy(query_buf[pos..][0..prefix.len], prefix);
-    pos += prefix.len;
-
-    const requested_fit = std.fmt.bufPrint(query_buf[pos..], "{d} BETWEEN GREATEST(p.pronargs - p.pronargdefaults, 0) AND p.pronargs THEN 0 WHEN ", .{requested_param_count}) catch return pos;
-    pos += requested_fit.len;
-
-    const fallback_flag = if (allow_single_unnamed_fallback) "TRUE" else "FALSE";
-    @memcpy(query_buf[pos..][0..fallback_flag.len], fallback_flag);
-    pos += fallback_flag.len;
-
-    // Correlate argument metadata with the matching function OID. Aggregating
-    // every pg_proc entry here made each small RPC scan the complete catalog.
-    // No cache: DDL changes and per-database metadata remain immediately visible.
-    const middle_prefix =
-        " AND COALESCE(meta.unnamed_count, 0) = 1 AND COALESCE(meta.single_unnamed_kind, '') <> '' THEN 1 WHEN p.pronargs = 0 THEN 2 ELSE 3 END AS match_rank FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace JOIN pg_type t ON t.oid = p.prorettype LEFT JOIN LATERAL (SELECT p2.oid, COUNT(*) FILTER (WHERE COALESCE(a.name, '') = '') AS unnamed_count, MAX(CASE WHEN COALESCE(a.name, '') = '' THEN CASE format_type(a.type_oid, NULL) WHEN 'json' THEN 'json' WHEN 'jsonb' THEN 'json' WHEN 'text' THEN 'text' WHEN 'xml' THEN 'xml' WHEN 'bytea' THEN 'bytea' ELSE '' END ELSE '' END) AS single_unnamed_kind, MAX(CASE WHEN a.mode = 'v' THEN COALESCE(a.name, '') ELSE '' END) AS variadic_param_name, STRING_AGG(CASE WHEN COALESCE(a.name, '') <> '' THEN COALESCE(a.name, '') ELSE NULL END, ',' ORDER BY a.ord) AS input_param_names FROM pg_proc p2 LEFT JOIN LATERAL (SELECT ord, COALESCE(p2.proargnames[ord], '') AS name, COALESCE(p2.proallargtypes[ord], p2.proargtypes[ord - 1]) AS type_oid, COALESCE(p2.proargmodes[ord], 'i') AS mode FROM generate_series(1, COALESCE(array_length(p2.proallargtypes, 1), array_length(p2.proargnames, 1), p2.pronargs)) ord) a ON TRUE WHERE p2.oid = p.oid AND a.type_oid IS NOT NULL AND a.mode IN ('i','v') GROUP BY p2.oid) meta ON TRUE WHERE p.prokind = 'f' AND pn.nspname = ";
-    @memcpy(query_buf[pos..][0..middle_prefix.len], middle_prefix);
-    pos += middle_prefix.len;
+    const prefix = "WITH supplied(names) AS (VALUES(ARRAY[";
+    @memcpy(query_buf[0..prefix.len], prefix);
+    var pos = prefix.len;
+    for (call.params[0..call.param_count], 0..) |param, i| {
+        if (i > 0) {
+            query_buf[pos] = ',';
+            pos += 1;
+        }
+        if (pos + pgrest_sql.literal_size(param.name) + 3000 >= query_buf.len) return 0;
+        pos = append_sql_quoted(query_buf, pos, param.name);
+    }
+    const selection = "]) SELECT p.provolatile, p.proretset, (t.typtype='c' OR COALESCE(p.proargmodes::text[] && '{t,b,o}',false)), p.provariadic>0, COALESCE(meta.unnamed_count,0), COALESCE(meta.unnamed_kind,''), COALESCE(meta.variadic_name,''), COALESCE(meta.names,''), CASE WHEN COALESCE(meta.all_names,'{}') @> supplied.names AND COALESCE(meta.required_names,'{}') <@ supplied.names THEN 0 WHEN ";
+    // An empty ARRAY needs an explicit element type.
+    const array_end = "]::text[])) ";
+    @memcpy(query_buf[pos..][0..array_end.len], array_end);
+    pos += array_end.len;
+    @memcpy(query_buf[pos..][0..selection[3..].len], selection[3..]);
+    pos += selection[3..].len;
+    const flag = if (allow_single_unnamed_fallback) "TRUE" else "FALSE";
+    @memcpy(query_buf[pos..][0..flag.len], flag);
+    pos += flag.len;
+    const catalog = " AND p.pronargs=1 AND meta.unnamed_count=1 AND meta.unnamed_kind<>'' THEN 1 ELSE 3 END AS match_rank, COALESCE(meta.types,'{}'::jsonb), p.prorettype='void'::regtype, COALESCE(meta.signature,'') FROM pg_proc p JOIN pg_namespace pn ON pn.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype CROSS JOIN supplied LEFT JOIN LATERAL (SELECT count(*) FILTER(WHERE name='') AS unnamed_count, max(CASE WHEN name='' THEN CASE type_oid WHEN 114 THEN 'json' WHEN 3802 THEN 'json' WHEN 25 THEN 'text' WHEN 142 THEN 'xml' WHEN 17 THEN 'bytea' ELSE '' END ELSE '' END) AS unnamed_kind, max(CASE WHEN mode='v' THEN name ELSE '' END) AS variadic_name, string_agg(name,',' ORDER BY ord) AS names, array_agg(name ORDER BY ord) AS all_names, array_agg(name ORDER BY ord) FILTER(WHERE input_ord<=p.pronargs-p.pronargdefaults) AS required_names, jsonb_object_agg(name,format_type(type_oid,NULL)) AS types, string_agg(name||' => '||format_type(type_oid,NULL),', ' ORDER BY ord) AS signature FROM (SELECT a.*, row_number() OVER(ORDER BY ord) AS input_ord FROM (SELECT ord, COALESCE(p.proargnames[ord],'') AS name, COALESCE(p.proallargtypes[ord],p.proargtypes[ord-1]) AS type_oid, COALESCE(p.proargmodes[ord],'i') AS mode FROM generate_series(1,COALESCE(array_length(p.proallargtypes,1),p.pronargs)) ord) a WHERE mode IN ('i','b','v')) a) meta ON TRUE WHERE p.prokind='f' AND pn.nspname=";
+    @memcpy(query_buf[pos..][0..catalog.len], catalog);
+    pos += catalog.len;
     pos = append_sql_quoted(query_buf, pos, schema_name orelse "public");
-
-    const middle = " AND p.proname = ";
-    @memcpy(query_buf[pos..][0..middle.len], middle);
-    pos += middle.len;
+    const name_filter = " AND p.proname=";
+    @memcpy(query_buf[pos..][0..name_filter.len], name_filter);
+    pos += name_filter.len;
     pos = append_sql_quoted(query_buf, pos, function_name);
-
-    const suffix = " ORDER BY match_rank ASC, p.pronargs ASC LIMIT 1";
+    const suffix = " ORDER BY match_rank,p.oid";
     @memcpy(query_buf[pos..][0..suffix.len], suffix);
-    pos += suffix.len;
-    return pos;
+    return pos + suffix.len;
 }
 
 fn parse_rpc_metadata_result(result: ?*PGresult) RpcMetadata {
@@ -5787,10 +6273,17 @@ fn parse_rpc_metadata_result(result: ?*PGresult) RpcMetadata {
         const rank_ptr = pgGetvalue(result, 0, 8);
         const raw_rank = if (rank_ptr != null) std.mem.span(rank_ptr) else "2";
         const rank = std.fmt.parseInt(usize, raw_rank, 10) catch 2;
-        if (rank >= 3) return .{};
+        if (rank >= 2) return .{};
+        if (pgNtuples(result) > 1 and std.mem.eql(u8, raw_rank, std.mem.span(pgGetvalue(result, 1, 8)))) return .{ .ambiguous = true };
     }
 
     var metadata: RpcMetadata = .{ .found = true };
+    if (pgNfields(result) >= 12) {
+        const types = std.mem.span(pgGetvalue(result, 0, 9));
+        // Borrowed until start_pooled_query clears this metadata PGresult.
+        metadata.input_types = types;
+        metadata.returns_void = pgGetvalue(result, 0, 10)[0] == 't';
+    }
 
     if (pgGetisnull(result, 0, 0) == 0) {
         const volatility_ptr = pgGetvalue(result, 0, 0);
@@ -5804,6 +6297,7 @@ fn parse_rpc_metadata_result(result: ?*PGresult) RpcMetadata {
 
     const proretset_ptr = pgGetvalue(result, 0, 1);
     const proretset = pgGetisnull(result, 0, 1) == 0 and proretset_ptr != null and proretset_ptr[0] == 't';
+    metadata.returns_set = proretset;
     const composite_ptr = pgGetvalue(result, 0, 2);
     const rettype_is_composite = pgGetisnull(result, 0, 2) == 0 and composite_ptr != null and composite_ptr[0] == 't';
     metadata.return_kind = if (rettype_is_composite)
@@ -5879,7 +6373,9 @@ fn filter_rpc_query_args_by_metadata(
         if (pair.len > 0) {
             const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
             const raw_name = pair[0..eq];
-            const matches_rpc = rpc_metadata_has_named_param(metadata, raw_name);
+            var decoded_name: [128]u8 = undefined;
+            const name_len = decode_rpc_query_component_into(&decoded_name, raw_name) orelse 0;
+            const matches_rpc = rpc_metadata_has_named_param(metadata, decoded_name[0..name_len]);
             if (matches_rpc == include_rpc_args) {
                 if (pos > 0) {
                     out[pos] = '&';
@@ -5927,21 +6423,20 @@ fn collapse_rpc_variadic_param(rpc_call: *RpcCall, metadata: *const RpcMetadata)
     }
     if (match_count == 0) return;
     rpc_call.params[match_indexes[0]].is_variadic = true;
-    if (match_count == 1) return;
+    // JSON arrays already have an SQL array expression. Query arguments,
+    // including one occurrence, need a typed-by-the-function array input.
+    if (match_count == 1 and (rpc_call.params[match_indexes[0]].is_raw or rpc_call.params[match_indexes[0]].json_body or rpc_call.params[match_indexes[0]].is_null)) return;
 
     const first_index = match_indexes[0];
     var pos: usize = 0;
-    const prefix = "ARRAY[";
-    var array_buf: [2048]u8 = undefined;
+    const prefix = "{";
+    var array_buf: [MAX_QUERY_SIZE]u8 = undefined;
     @memcpy(array_buf[pos..][0..prefix.len], prefix);
     pos += prefix.len;
 
     for (match_indexes[0..match_count], 0..) |param_index, arr_i| {
         const param = rpc_call.params[param_index];
-        const value_len = if (param.is_raw or param.is_boolean or param.is_numeric or param.is_null)
-            param.value.len
-        else
-            pgrest_sql.literal_size(param.value);
+        const value_len = 2 * param.value.len + 2;
         if (pos + value_len + 2 >= array_buf.len) {
             rpc_call.invalid_params = true;
             return;
@@ -5950,17 +6445,48 @@ fn collapse_rpc_variadic_param(rpc_call: *RpcCall, metadata: *const RpcMetadata)
             array_buf[pos] = ',';
             pos += 1;
         }
-        pos = append_variadic_scalar(&array_buf, pos, param);
+        // ARRAY['1','2'] fixes text[] too early for integer[] arguments.
+        // Bind the array input and let PostgreSQL infer the element type.
+        if (param.is_null) {
+            @memcpy(array_buf[pos..][0..4], "NULL");
+            pos += 4;
+        } else {
+            array_buf[pos] = '"';
+            pos += 1;
+            for (param.value) |c| {
+                if (c == '"' or c == '\\') {
+                    array_buf[pos] = '\\';
+                    pos += 1;
+                }
+                array_buf[pos] = c;
+                pos += 1;
+            }
+            array_buf[pos] = '"';
+            pos += 1;
+        }
     }
 
-    array_buf[pos] = ']';
+    array_buf[pos] = '}';
     pos += 1;
-    @memcpy(rpc_call.params[first_index].value_buf[0..pos], array_buf[0..pos]);
-    rpc_call.params[first_index].value = rpc_call.params[first_index].value_buf[0..pos];
+    const storage = if (pos <= rpc_call.params[first_index].value_buf.len)
+        rpc_call.params[first_index].value_buf[0..pos]
+    else blk: {
+        if (rpc_call.pool == null) {
+            rpc_call.invalid_params = true;
+            return;
+        }
+        const memory = core.ngx_pnalloc(rpc_call.pool, pos) orelse {
+            rpc_call.invalid_params = true;
+            return;
+        };
+        break :blk @as([*]u8, @ptrCast(memory))[0..pos];
+    };
+    @memcpy(storage, array_buf[0..pos]);
+    rpc_call.params[first_index].value = storage;
     rpc_call.params[first_index].is_null = false;
     rpc_call.params[first_index].is_numeric = false;
     rpc_call.params[first_index].is_boolean = false;
-    rpc_call.params[first_index].is_raw = true;
+    rpc_call.params[first_index].is_raw = false;
     rpc_call.params[first_index].name = variadic_name;
 
     var new_count: usize = 0;
@@ -5976,7 +6502,7 @@ fn collapse_rpc_variadic_param(rpc_call: *RpcCall, metadata: *const RpcMetadata)
         }
         if (skip) continue;
         if (new_count != i) {
-            rpc_call.params[new_count] = rpc_call.params[i];
+            copy_rpc_param(&rpc_call.params[new_count], &rpc_call.params[i]);
         }
         new_count += 1;
     }
@@ -6026,15 +6552,19 @@ fn build_rpc_table_query(
     pos += 1;
 
     var i: usize = 0;
+    var emitted = false;
     while (i < rpc_params.param_count) : (i += 1) {
-        if (i > 0) {
+        const param_index = rpc_parameter_index(rpc_params, i);
+        if (rpc_parameter_shadowed(rpc_params, param_index)) continue;
+        if (emitted) {
             query_buf[pos] = ',';
             pos += 1;
             query_buf[pos] = ' ';
             pos += 1;
         }
 
-        const param = rpc_params.params[i];
+        const param = rpc_params.params[param_index];
+        emitted = true;
         if (param.is_variadic) {
             const variadic = "VARIADIC ";
             @memcpy(query_buf[pos..][0..variadic.len], variadic);
@@ -6052,7 +6582,9 @@ fn build_rpc_table_query(
             pos += 1;
         }
 
-        if (param.is_raw) {
+        if (param.json_body) {
+            pos = append_rpc_json_argument(query_buf, pos, param, params);
+        } else if (param.is_raw) {
             @memcpy(query_buf[pos..][0..param.value.len], param.value);
             pos += param.value.len;
         } else if (param.is_null) {
@@ -6138,11 +6670,113 @@ fn build_rpc_table_query(
 
 fn rpc_method_not_allowed_response(r: [*c]ngx_http_request_t, metadata: RpcMetadata) ngx_int_t {
     _ = append_response_header(r, "Allow", "allow", rpc_allow_header(metadata));
-    return send_json_error(r, NGX_HTTP_METHOD_NOT_ALLOWED, "{\"message\":\"The HTTP method is not allowed for this RPC function\"}");
+    var message: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&message, "Cannot use the {s} method on RPC", .{r.*.method_name.data[0..r.*.method_name.len]}) catch unreachable;
+    return send_protocol_error(r, 405, "PGRST101", text, null, null);
 }
 
 fn rpc_metadata_not_found_response(r: [*c]ngx_http_request_t) ngx_int_t {
     return send_json_error(r, http.NGX_HTTP_NOT_FOUND, "{\"message\":\"Undefined function\"}");
+}
+
+fn rpc_names_list(storage: []u8, names: [][]const u8) ?[]const u8 {
+    std.mem.sort([]const u8, names, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    var pos: usize = 0;
+    var previous: ?[]const u8 = null;
+    for (names) |name| {
+        if (previous != null and std.mem.eql(u8, previous.?, name)) continue;
+        if (name.len + @as(usize, if (pos > 0) 2 else 0) > storage.len - pos) return null;
+        if (pos > 0) {
+            @memcpy(storage[pos..][0..2], ", ");
+            pos += 2;
+        }
+        @memcpy(storage[pos..][0..name.len], name);
+        pos += name.len;
+        previous = name;
+    }
+    return storage[0..pos];
+}
+
+fn rpc_error_storage(r: [*c]ngx_http_request_t, size: usize) ?[]u8 {
+    const memory = core.ngx_pnalloc(r.*.pool, size) orelse return null;
+    const bytes: [*]u8 = @ptrCast(memory);
+    return bytes[0..size];
+}
+
+test "RPC error argument lists sort, deduplicate and reject insufficient storage" {
+    var names = [_][]const u8{ "beta", "alpha", "beta" };
+    var storage: [11]u8 = undefined;
+    try std.testing.expectEqualStrings("alpha, beta", rpc_names_list(&storage, &names).?);
+    try std.testing.expect(rpc_names_list(storage[0..10], &names) == null);
+}
+
+fn rpc_resolution_error(r: [*c]ngx_http_request_t, result: *PGresult, ambiguous: bool) ngx_int_t {
+    const lc = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module)).?;
+    const schema = resolved_default_schema_name(resolve_request_schema(r, lc)) orelse "public";
+    const function = extract_rpc_function_name(r.*.uri).?;
+    var message: [4096]u8 = undefined;
+    if (ambiguous) {
+        const prefix = "Could not choose the best candidate function between: ";
+        @memcpy(message[0..prefix.len], prefix);
+        var pos = prefix.len;
+        var row: i32 = 0;
+        while (row < pgNtuples(result)) : (row += 1) {
+            if (!std.mem.eql(u8, std.mem.span(pgGetvalue(result, row, 8)), std.mem.span(pgGetvalue(result, 0, 8)))) break;
+            const part = std.fmt.bufPrint(message[pos..], "{s}{s}.{s}({s})", .{ if (row > 0) ", " else "", schema, function, std.mem.span(pgGetvalue(result, row, 11)) }) catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+            pos += part.len;
+        }
+        return send_protocol_error(r, 300, "PGRST203", message[0..pos], null, "Try renaming the parameters or the function itself in the database so function overloading can be resolved");
+    }
+    const call: *RpcCall = @ptrCast(@alignCast(core.ngx_pcalloc(r.*.pool, @sizeOf(RpcCall)) orelse return 500));
+    call.* = .{ .function_name = function, .params = undefined, .param_count = 0 };
+    const media = parse_content_type_from_request(r);
+    if (get_request_body_slice(r)) |body| parse_rpc_body_params(media, body, r.*.pool, call) else parse_rpc_pairs(r.*.args, call, true, r.*.pool);
+    var names: [MAX_RPC_PARAMS][]const u8 = undefined;
+    for (call.params[0..call.param_count], 0..) |param, i| names[i] = param.name;
+    var arguments_size: usize = 0;
+    for (names[0..call.param_count]) |name| arguments_size += name.len + 2;
+    const arguments_storage = rpc_error_storage(r, arguments_size + 1) orelse return 500;
+    const arguments = rpc_names_list(arguments_storage, names[0..call.param_count]) orelse return 500;
+    const suffix_storage = rpc_error_storage(r, arguments.len + 32) orelse return 500;
+    const suffix = if (arguments.len == 0) " without parameters" else std.fmt.bufPrint(suffix_storage, "({s})", .{arguments}) catch return 500;
+    const message_storage = rpc_error_storage(r, schema.len + function.len + arguments.len + 256) orelse return 500;
+    const msg = std.fmt.bufPrint(message_storage, "Could not find the function {s}.{s}{s} in the schema cache", .{ schema, function, suffix }) catch return 500;
+    const detail_storage = rpc_error_storage(r, message_storage.len + 256) orelse return 500;
+    const param_storage = rpc_error_storage(r, arguments.len + 32) orelse return 500;
+    const parameters = if (arguments.len == 0) " without parameters" else std.fmt.bufPrint(param_storage, " with parameter{s} {s}", .{ if (rpc_unique_param_count(call) == 1) "" else "s", arguments }) catch return 500;
+    const detail = std.fmt.bufPrint(detail_storage, "Searched for the function {s}.{s}{s}{s}, but no matches were found in the schema cache.", .{ schema, function, parameters, if (r.*.method == http.NGX_HTTP_POST and media == .json) " or with a single unnamed json/jsonb parameter" else "" }) catch return 500;
+    var hint: ?[]const u8 = null;
+    // Same-name candidates remain available for useful parameter suggestions.
+    if (pgNtuples(result) > 0) {
+        var candidate_names: [MAX_RPC_PARAMS][]const u8 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, std.mem.span(pgGetvalue(result, 0, 7)), ',');
+        while (it.next()) |name| {
+            if (name.len > 0 and count < candidate_names.len) {
+                candidate_names[count] = name;
+                count += 1;
+            }
+        }
+        var candidate_size: usize = 0;
+        for (candidate_names[0..count]) |name| candidate_size += name.len + 2;
+        const candidate_storage = rpc_error_storage(r, candidate_size + 1) orelse return 500;
+        const candidate = rpc_names_list(candidate_storage, candidate_names[0..count]) orelse return 500;
+        var shared = false;
+        for (call.params[0..call.param_count]) |param| for (candidate_names[0..count]) |name| {
+            if (std.mem.eql(u8, param.name, name)) {
+                shared = true;
+            }
+        };
+        if (shared) {
+            const hint_storage = rpc_error_storage(r, schema.len + function.len + candidate.len + 128) orelse return 500;
+            hint = std.fmt.bufPrint(hint_storage, "Perhaps you meant to call the function {s}.{s}({s})", .{ schema, function, candidate }) catch null;
+        }
+    }
+    return send_protocol_error(r, 404, "PGRST202", msg, detail, hint);
 }
 
 fn apply_rpc_single_unnamed_param(
@@ -6155,7 +6789,9 @@ fn apply_rpc_single_unnamed_param(
     if (!rpc_single_unnamed_kind_media_matches(metadata.single_unnamed_kind, body_format)) return false;
 
     _ = rpc_single_unnamed_kind_type_name(metadata.single_unnamed_kind);
-    set_rpc_single_raw_param(rpc_call, "", body_data);
+    const trimmed = std.mem.trim(u8, body_data, " \t\r\n");
+    const payload = if (metadata.single_unnamed_kind == .json and trimmed.len > 0 and trimmed[0] != '{' and trimmed[0] != '[') "[]" else body_data;
+    set_rpc_single_raw_param(rpc_call, "", payload);
     rpc_call.params[0].is_raw = false;
     rpc_call.invalid_params = false;
     return true;
@@ -6230,6 +6866,7 @@ fn parse_rpc_json_body(
     body: []const u8,
     rpc_call: *RpcCall,
 ) void {
+    rpc_call.pool = pool;
     rpc_call.invalid_params = true;
     if (body.len == 0) return;
 
@@ -6239,6 +6876,8 @@ fn parse_rpc_json_body(
         rpc_call.params[0].value = body;
         rpc_call.params[0].is_raw = false;
         rpc_call.params[0].is_variadic = false;
+        rpc_call.params[0].json_body = false;
+        rpc_call.params[0].type_len = 0;
         rpc_call.params[0].is_null = false;
         rpc_call.params[0].is_numeric = false;
         rpc_call.params[0].is_boolean = false;
@@ -6247,160 +6886,59 @@ fn parse_rpc_json_body(
         return;
     }
 
-    // Initialize cJSON with pool allocator
-    var json_parser = cjson.CJSON.init(pool);
-
-    // Copy body to null-terminated buffer
-    var body_buf: [4096]u8 = undefined;
-    if (body.len >= body_buf.len) return;
-    @memcpy(body_buf[0..body.len], body);
-    body_buf[body.len] = 0;
-
-    const body_str = ngx_str_t{ .data = &body_buf, .len = body.len };
-
-    // Parse JSON
-    const json = json_parser.decode(body_str) catch return;
-    if (json == core.nullptr(cjson.cJSON)) return;
-
-    // Iterate over object fields
-    var it = cjson.CJSON.Iterator.init(json);
-    var count: usize = 0;
-
-    while (it.next()) |item| {
-        if (count >= MAX_RPC_PARAMS) return;
-
-        // Get field name
-        if (item.*.string != core.nullptr(u8)) {
-            var name_len: usize = 0;
-            while (item.*.string[name_len] != 0 and name_len < 256) : (name_len += 1) {}
-            rpc_call.params[count].name = item.*.string[0..name_len];
-            rpc_call.params[count].is_variadic = false;
-
-            // Get field value
-            if (cjson.cJSON_IsNull(item) == 1) {
-                rpc_call.params[count].value = "NULL";
-                rpc_call.params[count].is_null = true;
-                rpc_call.params[count].is_numeric = false;
-                rpc_call.params[count].is_boolean = false;
-                rpc_call.params[count].is_raw = false;
-            } else if (cjson.cJSON_IsNumber(item) == 1) {
-                rpc_call.params[count].value = format_json_number(
-                    cjson.cJSON_GetNumberValue(item),
-                    &rpc_call.params[count].value_buf,
-                );
-                rpc_call.params[count].is_null = false;
-                rpc_call.params[count].is_numeric = true;
-                rpc_call.params[count].is_boolean = false;
-                rpc_call.params[count].is_raw = false;
-            } else if (cjson.cJSON_IsString(item) == 1) {
-                if (cjson.cJSON_GetStringValue(item)) |str| {
-                    var str_len: usize = 0;
-                    while (str[str_len] != 0 and str_len <= 2048) : (str_len += 1) {}
-                    if (str_len > 2048) return;
-                    rpc_call.params[count].value = str[0..str_len];
-                } else {
-                    rpc_call.params[count].value = "";
-                }
-                rpc_call.params[count].is_null = false;
-                rpc_call.params[count].is_numeric = false;
-                rpc_call.params[count].is_boolean = false;
-                rpc_call.params[count].is_raw = false;
-            } else if (cjson.cJSON_IsBool(item) == 1) {
-                rpc_call.params[count].value = if (cjson.cJSON_IsTrue(item) == 1) "true" else "false";
-                rpc_call.params[count].is_null = false;
-                rpc_call.params[count].is_numeric = false;
-                rpc_call.params[count].is_boolean = true;
-                rpc_call.params[count].is_raw = false;
-            } else if (cjson.cJSON_IsObject(item) == 1) {
-                // Send nested JSON as an unknown-typed, bound parameter. The
-                // selected function's json/jsonb argument supplies the type.
-                const encoded = json_parser.encode(item) catch return;
-                if (encoded.len > 2048) return;
-                rpc_call.params[count].value = core.slicify(u8, encoded.data, encoded.len);
-                rpc_call.params[count].is_null = false;
-                rpc_call.params[count].is_numeric = false;
-                rpc_call.params[count].is_boolean = false;
-                rpc_call.params[count].is_raw = false;
-            } else if (cjson.cJSON_IsArray(item) == 1) {
-                // Support for array parameters - store as ARRAY constructor syntax
-                // Convert array elements into ARRAY[...] format
-                var arr_pos: usize = 0;
-                var arr_buf = &rpc_call.params[count].value_buf;
-
-                // Start with ARRAY[
-                const arr_prefix = "ARRAY[";
-                @memcpy(arr_buf[arr_pos..][0..arr_prefix.len], arr_prefix);
-                arr_pos += arr_prefix.len;
-
-                // Iterate array elements
-                var arr_item = item.*.child;
-                var arr_index: i32 = 0;
-                while (arr_item != null and arr_pos < arr_buf.len - 10) {
-                    if (arr_index > 0) {
-                        arr_buf[arr_pos] = ',';
-                        arr_pos += 1;
-                    }
-
-                    if (cjson.cJSON_IsNumber(arr_item) == 1) {
-                        const num_str = format_json_number(
-                            cjson.cJSON_GetNumberValue(arr_item),
-                            arr_buf[arr_pos..],
-                        );
-                        if (arr_pos + num_str.len < arr_buf.len) {
-                            arr_pos += num_str.len;
-                        }
-                    } else if (cjson.cJSON_IsString(arr_item) == 1) {
-                        if (cjson.cJSON_GetStringValue(arr_item)) |str| {
-                            var s_len: usize = 0;
-                            while (str[s_len] != 0 and s_len <= 2048) : (s_len += 1) {}
-                            if (s_len > 2048 or arr_pos + pgrest_sql.literal_size(str[0..s_len]) + 1 >= arr_buf.len) return;
-                            arr_pos = append_sql_quoted(arr_buf, arr_pos, str[0..s_len]);
-                        }
-                    } else if (cjson.cJSON_IsBool(arr_item) == 1) {
-                        const bool_str = if (cjson.cJSON_IsTrue(arr_item) == 1) "true" else "false";
-                        if (arr_pos + bool_str.len < arr_buf.len) {
-                            @memcpy(arr_buf[arr_pos..][0..bool_str.len], bool_str);
-                            arr_pos += bool_str.len;
-                        }
-                    } else if (cjson.cJSON_IsNull(arr_item) == 1) {
-                        const null_str = "NULL";
-                        if (arr_pos + null_str.len < arr_buf.len) {
-                            @memcpy(arr_buf[arr_pos..][0..null_str.len], null_str);
-                            arr_pos += null_str.len;
-                        }
-                    } else {
-                        return;
-                    }
-
-                    arr_item = arr_item.*.next;
-                    arr_index += 1;
-                }
-                if (arr_item != null) return;
-
-                // Close with ]
-                arr_buf[arr_pos] = ']';
-                arr_pos += 1;
-
-                rpc_call.params[count].value = arr_buf[0..arr_pos];
-                rpc_call.params[count].is_null = false;
-                rpc_call.params[count].is_numeric = false;
-                rpc_call.params[count].is_boolean = false;
-                rpc_call.params[count].is_raw = true;
-            } else {
-                continue; // Skip unsupported types (nested objects)
-            }
-
-            count += 1;
-        }
-    }
-
-    rpc_call.param_count = count;
+    var parser = CJSON.init(pool);
+    const json = parser.decodeDocument(.{ .data = @constCast(body.ptr), .len = body.len }) catch return;
+    rpc_call.param_count = 0;
     rpc_call.invalid_params = false;
+    if (cjson.cJSON_IsObject(json) != 1) return;
+    var it = CJSON.Iterator.init(json);
+    while (it.next()) |item| {
+        const name = std.mem.span(item.*.string);
+        var duplicate = false;
+        for (rpc_call.params[0..rpc_call.param_count]) |param| if (std.mem.eql(u8, param.name, name)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) continue;
+        if (rpc_call.param_count >= MAX_RPC_PARAMS) {
+            rpc_call.invalid_params = true;
+            return;
+        }
+        const param = &rpc_call.params[rpc_call.param_count];
+        // Keep the ORIGINAL document. PostgreSQL json_to_record applies the
+        // catalog type, preserves exact numerics and chooses the last key.
+        param.* = .{ .name = name, .value = body, .json_body = true };
+        rpc_call.param_count += 1;
+    }
 }
 
-/// Parse query string parameters as RPC function arguments
-/// Format: ?param1=value1&param2=value2
+fn decode_rpc_query_component_into(out: []u8, raw: []const u8) ?usize {
+    var i: usize = 0;
+    var written: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        if (written == out.len) return null;
+        var c = raw[i];
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' and i + 2 < raw.len and std.ascii.isHex(raw[i + 1]) and std.ascii.isHex(raw[i + 2])) {
+            // PostgREST preserves malformed percent escapes in query values.
+            if (std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16)) |decoded| {
+                c = decoded;
+                i += 2;
+            } else |_| {}
+        }
+        out[written] = c;
+        written += 1;
+    }
+    return written;
+}
+
 fn parse_rpc_params(args: ngx_str_t, rpc_call: *RpcCall) void {
+    parse_rpc_pairs(args, rpc_call, true, null);
+}
+
+fn parse_rpc_pairs(args: ngx_str_t, rpc_call: *RpcCall, query_arguments: bool, pool: [*c]ngx_pool_t) void {
+    rpc_call.pool = pool;
     if (args.len == 0 or args.data == core.nullptr(u8)) {
         return;
     }
@@ -6409,7 +6947,7 @@ fn parse_rpc_params(args: ngx_str_t, rpc_call: *RpcCall) void {
     var count: usize = 0;
     var pos: usize = 0;
 
-    while (pos < query.len and count < MAX_RPC_PARAMS) {
+    while (pos < query.len) {
         // Find end of this parameter (& or end of string)
         var param_end = pos;
         while (param_end < query.len and query[param_end] != '&') {
@@ -6424,15 +6962,40 @@ fn parse_rpc_params(args: ngx_str_t, rpc_call: *RpcCall) void {
             eq_pos += 1;
         }
 
-        if (eq_pos > 0 and eq_pos < param.len - 1) {
-            rpc_call.params[count].name = param[0..eq_pos];
-            rpc_call.params[count].is_variadic = false;
-            rpc_call.params[count].value = param[eq_pos + 1 ..];
-            rpc_call.params[count].is_null = false;
-            rpc_call.params[count].is_numeric = is_numeric(rpc_call.params[count].value);
-            rpc_call.params[count].is_boolean = std.mem.eql(u8, rpc_call.params[count].value, "true") or std.mem.eql(u8, rpc_call.params[count].value, "false");
-            rpc_call.params[count].is_raw = false;
+        if (param.len > 0 and (eq_pos < param.len or !query_arguments)) {
+            rpc_call.invalid_params = true;
+            if (eq_pos == 0 or count == MAX_RPC_PARAMS) return;
+            const current = &rpc_call.params[count];
+            const name_len = decode_rpc_query_component_into(&current.name_buf, param[0..eq_pos]) orelse return;
+            const raw_value = if (eq_pos < param.len) param[eq_pos + 1 ..] else "";
+            const storage = if (raw_value.len > current.value_buf.len and pool != null) blk: {
+                const memory = core.ngx_pnalloc(pool, raw_value.len) orelse return;
+                break :blk @as([*]u8, @ptrCast(memory))[0..raw_value.len];
+            } else current.value_buf[0..];
+            const value_len = decode_rpc_query_component_into(storage, raw_value) orelse return;
+            current.name = current.name_buf[0..name_len];
+            current.value = storage[0..value_len];
+            if (query_arguments and is_rpc_read_parameter(current.name, current.value)) {
+                rpc_call.invalid_params = false;
+                pos = param_end + 1;
+                continue;
+            }
+            // Match 16.4's text-protocol value semantics: libpq terminates an
+            // HTTP query value at NUL. Identifiers must never contain NUL.
+            if (std.mem.indexOfScalar(u8, current.name, 0) != null) return;
+            if (std.mem.indexOfScalar(u8, current.value, 0)) |nul| current.value = current.value[0..nul];
+            current.is_variadic = false;
+            current.json_body = false;
+            current.type_len = 0;
+            current.is_null = false;
+            // HTTP query values are strings. Let PostgreSQL's declared argument
+            // type interpret them; guessing from spelling breaks text values
+            // such as "123", "true" and decimal values passed to integer args.
+            current.is_numeric = false;
+            current.is_boolean = false;
+            current.is_raw = false;
             count += 1;
+            rpc_call.invalid_params = false;
         }
 
         pos = param_end + 1; // Skip the '&'
@@ -6441,50 +7004,16 @@ fn parse_rpc_params(args: ngx_str_t, rpc_call: *RpcCall) void {
     rpc_call.param_count = count;
 }
 
-fn parse_rpc_form_body(body: []const u8, rpc_call: *RpcCall) void {
-    rpc_call.invalid_params = true;
-    if (body.len == 0) return;
-    if (rpc_call.prefer_single_object) return;
-
-    var count: usize = 0;
-    var start: usize = 0;
-
-    while (start <= body.len and count < MAX_RPC_PARAMS) {
-        var end = start;
-        while (end < body.len and body[end] != '&') : (end += 1) {}
-
-        const pair = body[start..end];
-        if (pair.len > 0) {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-            const raw_name = pair[0..eq];
-            const raw_value = if (eq < pair.len) pair[eq + 1 ..] else "";
-
-            const name_len = decode_form_component_into(&rpc_call.params[count].value_buf, raw_name) orelse return;
-            if (name_len == 0) return;
-
-            rpc_call.params[count].name = rpc_call.params[count].value_buf[0..name_len];
-            rpc_call.params[count].is_variadic = false;
-
-            const value_storage = rpc_call.raw_body[count * 256 .. @min(rpc_call.raw_body.len, (count + 1) * 256)];
-            const value_len = decode_form_component_into(value_storage, raw_value) orelse return;
-            rpc_call.params[count].value = value_storage[0..value_len];
-            rpc_call.params[count].is_null = false;
-            rpc_call.params[count].is_numeric = is_numeric(rpc_call.params[count].value);
-            rpc_call.params[count].is_boolean = std.mem.eql(u8, rpc_call.params[count].value, "true") or std.mem.eql(u8, rpc_call.params[count].value, "false");
-            rpc_call.params[count].is_raw = false;
-            count += 1;
-        }
-
-        if (end == body.len) {
-            start = body.len;
-            break;
-        }
-        start = end + 1;
-    }
-
-    if (start < body.len and count == MAX_RPC_PARAMS) return;
-    rpc_call.param_count = count;
+fn parse_rpc_form_body(body: []const u8, rpc_call: *RpcCall, pool: [*c]ngx_pool_t) void {
     rpc_call.invalid_params = false;
+    parse_rpc_pairs(.{ .data = @constCast(body.ptr), .len = body.len }, rpc_call, false, pool);
+}
+
+fn is_rpc_read_parameter(name: []const u8, value: []const u8) bool {
+    if (is_reserved_query_param(name) or std.mem.eql(u8, name, "and") or std.mem.eql(u8, name, "or") or std.mem.indexOfScalar(u8, name, '.') != null) return true;
+    const operand = if (std.mem.startsWith(u8, value, "not.")) value[4..] else value;
+    for ([_][]const u8{ "eq.", "neq.", "gt.", "gte.", "lt.", "lte.", "like.", "ilike.", "match.", "imatch.", "is.", "in.", "cs.", "cd.", "ov.", "sl.", "sr.", "nxr.", "nxl.", "adj.", "fts.", "plfts.", "phfts.", "wfts." }) |prefix| if (std.mem.startsWith(u8, operand, prefix)) return true;
+    return false;
 }
 
 fn set_rpc_single_raw_param(rpc_call: *RpcCall, name: []const u8, body: []const u8) void {
@@ -6498,6 +7027,8 @@ fn set_rpc_single_raw_param(rpc_call: *RpcCall, name: []const u8, body: []const 
     rpc_call.params[0].is_boolean = false;
     rpc_call.params[0].is_raw = false;
     rpc_call.params[0].is_variadic = false;
+    rpc_call.params[0].json_body = false;
+    rpc_call.params[0].type_len = 0;
     rpc_call.raw_body_len = body.len;
     rpc_call.param_count = 1;
 }
@@ -6533,15 +7064,19 @@ fn build_rpc_call_query(
 
     // Parameters as named arguments (PostgreSQL syntax)
     var i: usize = 0;
+    var emitted = false;
     while (i < rpc_params.param_count) : (i += 1) {
-        if (i > 0) {
+        const param_index = rpc_parameter_index(rpc_params, i);
+        if (rpc_parameter_shadowed(rpc_params, param_index)) continue;
+        if (emitted) {
             query_buf[pos] = ',';
             pos += 1;
             query_buf[pos] = ' ';
             pos += 1;
         }
 
-        const param = rpc_params.params[i];
+        const param = rpc_params.params[param_index];
+        emitted = true;
 
         if (param.is_variadic) {
             const variadic = "VARIADIC ";
@@ -6565,7 +7100,9 @@ fn build_rpc_call_query(
         // Parameter value handling
         // JSON arrays/objects are passed without quotes
         // Regular strings and other values are quoted
-        if (param.is_raw) {
+        if (param.json_body) {
+            pos = append_rpc_json_argument(query_buf, pos, param, params);
+        } else if (param.is_raw) {
             @memcpy(query_buf[pos..][0..param.value.len], param.value);
             pos += param.value.len;
         } else if (param.is_null) {
@@ -8185,7 +8722,7 @@ fn parse_rpc_body_params(
 ) void {
     switch (body_format) {
         .json => parse_rpc_json_body(pool, body_data, rpc_call),
-        .form_urlencoded => parse_rpc_form_body(body_data, rpc_call),
+        .form_urlencoded => parse_rpc_form_body(body_data, rpc_call, pool),
         .csv => set_rpc_single_raw_param(rpc_call, "data", body_data),
         .plain_text => set_rpc_single_raw_param(rpc_call, "data", body_data),
         .xml => set_rpc_single_raw_param(rpc_call, "data", body_data),
@@ -8268,7 +8805,7 @@ fn handle_rpc_call_upstream(
     };
 
     // Parse RPC parameters from query string or POST body
-    var rpc_call: RpcCall = undefined;
+    const rpc_call: *RpcCall = @ptrCast(core.ngz_pcalloc_c(RpcCall, r.*.pool) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR);
     rpc_call.param_count = 0;
     rpc_call.invalid_params = false;
     rpc_call.function_name = function_name;
@@ -8277,20 +8814,27 @@ fn handle_rpc_call_upstream(
 
     // Try to parse POST body first (if present)
     if (body_data) |payload| {
-        parse_rpc_body_params(body_format, payload, r.*.pool, &rpc_call);
+        parse_rpc_body_params(body_format, payload, r.*.pool, rpc_call);
     }
 
     // JSON argument shaping is only a catalog-lookup hint until metadata
     // distinguishes named arguments from one whole JSON argument. The latter
     // accepts nested objects/arrays and larger bodies through libpq binding.
     ctx.*.rpc_body_invalid = rpc_call.invalid_params;
+    if (rpc_call.invalid_params and body_format == .json) {
+        return send_protocol_error(r, 400, "PGRST102", "Empty or invalid json", null, null);
+    }
     if (rpc_call.invalid_params and body_format != .json) {
         return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}");
     }
 
     // If no body parameters, parse query string
     if (rpc_call.param_count == 0) {
-        parse_rpc_params(r.*.args, &rpc_call);
+        parse_rpc_pairs(r.*.args, rpc_call, true, r.*.pool);
+    }
+
+    if (rpc_call.invalid_params and body_data == null) {
+        return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}");
     }
 
     const effective_schema = resolved_default_schema_name(resolved_schema);
@@ -8300,7 +8844,7 @@ fn handle_rpc_call_upstream(
         &ctx[0].query,
         effective_schema,
         function_name,
-        rpc_unique_param_count(&rpc_call),
+        rpc_call,
         body_data != null and rpc_allow_single_unnamed_fallback(body_format, rpc_call.prefer_single_object),
     );
     ctx[0].query[ctx.*.query_len] = 0; // null terminate
@@ -8516,6 +9060,10 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
     ctx.*.write_status = if (is_write_request) write_contract.status else http.NGX_HTTP_OK;
     ctx.*.write_send_body = if (is_write_request) write_contract.send_body else true;
     ctx.*.is_write_request = is_write_request;
+    ctx.*.inline_count = !is_write_request and opts.response_format == .json and opts.prefer.count_mode == .exact;
+    ctx.*.page_limit = pagination.limit orelse 0;
+    ctx.*.has_page_limit = pagination.limit != null;
+    if (ctx.*.inline_count) ctx.*.prefer_count_applied = true;
 
     const table_query = if (sql_op == .select and select_plan.has_embeds) blk: {
         var table_names: [MAX_TABLE_NAMES][64]u8 = std.mem.zeroes([MAX_TABLE_NAMES][64]u8);
@@ -8547,7 +9095,7 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         select_buf[0..select_result.len],
         group_by_buf[0..group_by_result.len],
         order_specs[0..order_count],
-        pagination,
+        if (ctx.*.inline_count) .{ .limit = null, .offset = null } else pagination,
         if (is_write_request) write_contract.include_returning else true,
         ctx,
     ) orelse return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid write payload\"}");
@@ -8570,7 +9118,7 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         if (jwt_result == .unauthorized) return http.NGX_HTTP_UNAUTHORIZED;
         if (jwt_result == .failed) return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
 
-        if (!is_write_request and read_count_requested(opts)) {
+        if (!is_write_request and read_count_requested(opts) and !ctx.*.inline_count) {
             var count_query_buf: [MAX_QUERY_SIZE]u8 = undefined;
             const count_query_len = build_table_count_query(&count_query_buf, qualified_table, where_buf[0..where_len], opts.prefer.count_mode);
             if (!queue_followup_query(ctx, count_query_buf[0..count_query_len])) {
@@ -8667,12 +9215,24 @@ fn process_waiting_query_read(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, ev: [*
             }
 
             if (pgIsBusy(conn) == 0) {
-                ctx.*.result = pgGetResult(conn);
+                // PQgetResult may deliver several results for setup SQL. Keep
+                // errors, clear every superseded result, and check PQisBusy
+                // between results instead of blocking the nginx worker.
+                const next_result = pgGetResult(conn);
+                if (next_result) |next| {
+                    if (ctx.*.result) |previous| {
+                        if (pgResultStatus(previous) != PGRES_TUPLES_OK and pgResultStatus(previous) != PGRES_COMMAND_OK) {
+                            pgClear(next);
+                            continue;
+                        }
+                        pgClear(previous);
+                    }
+                    ctx.*.result = next;
+                    continue;
+                }
                 ctx.*.query_state = .done;
                 _ = set_pooled_timer_mode(ctx, pool_conn, false, false);
                 trace_pool_event(ctx, pool_conn, "result-ready");
-
-                while (pgGetResult(conn) != null) {}
 
                 finalize_pg_response(ctx);
                 return;
@@ -8725,29 +9285,9 @@ fn poll_pg_connection(ctx: *PgRequestCtx, pool_conn: *PgPoolConn) void {
             _ = set_pooled_timer_mode(ctx, pool_conn, false, false);
             trace_pool_event(ctx, pool_conn, "poll-ok");
 
-            // If we have a pending query, send it now
-            if (ctx.*.query_len > 0) {
-                const q_slice = std.mem.sliceTo(&ctx.*.query, 0);
-                const do_params = ctx.*.param_count > 0 and !ctx.*.param_overflow and
-                    std.mem.indexOfScalar(u8, q_slice, '$') != null;
-                const sent = if (do_params)
-                    pgSendQueryParams(conn, &ctx.*.query, @intCast(ctx.*.param_count), null, @ptrCast(&ctx.*.param_ptrs), null, null, 0)
-                else
-                    pgSendQuery(conn, &ctx.*.query);
-                if (sent != 0) {
-                    ctx.*.query_state = .sending;
-                    pool_conn.state = .busy;
-                    ctx.*.trace_query_seq += 1;
-                    trace_pool_event(ctx, pool_conn, "poll-send");
-
-                    // Try to flush immediately
-                    const flush_result = pgFlush(conn);
-                    if (!apply_query_flush_state(ctx, pool_conn, flush_result)) {
-                        ctx.*.query_state = .failed;
-                    }
-                } else {
-                    ctx.*.query_state = .failed;
-                }
+            if (ctx.*.query_len > 0 and !start_pooled_query(ctx, pool_conn)) {
+                finalize_pooled_failure(ctx);
+                return;
             }
         },
         PGRES_POLLING_FAILED => {
@@ -8809,8 +9349,20 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         return;
     }
 
-    const active_q = ctx.*.query[0..ctx.*.query_len];
-    if (status == PGRES_COMMAND_OK and (std.mem.startsWith(u8, active_q, "SET ") or std.mem.startsWith(u8, active_q, "RESET "))) {
+    if (ctx.*.transaction_phase == .commit) {
+        ctx.*.transaction_phase = .complete;
+        send_committed_response(ctx, opts);
+        return;
+    }
+    if (ctx.*.transaction_phase == .settings) {
+        if (!read_response_settings(ctx, result)) return;
+        ctx.*.transaction_phase = .commit;
+        _ = set_active_query(ctx, "COMMIT");
+        if (!start_pooled_query(ctx, ctx.*.pool_conn.?)) finalize_pooled_failure(ctx);
+        return;
+    }
+    if (ctx.*.transaction_phase == .setup) {
+        ctx.*.transaction_phase = .active;
         if (!promote_followup_query(ctx)) {
             finalize_pooled_failure(ctx);
             return;
@@ -8856,8 +9408,23 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     }
 
     // Format result as JSON
-    const ntuples = pgNtuples(result);
+    var ntuples = pgNtuples(result);
     const nfields = pgNfields(result);
+    if (ctx.*.rpc_phase == .call and ctx.*.inline_count) {
+        if (ntuples != 1 or nfields != 3) {
+            finalize_pooled_failure(ctx);
+            return;
+        }
+        ntuples = std.fmt.parseInt(i32, std.mem.span(pgGetvalue(result, 0, 1)), 10) catch {
+            finalize_pooled_failure(ctx);
+            return;
+        };
+        ctx.*.total_count = std.fmt.parseInt(i64, std.mem.span(pgGetvalue(result, 0, 2)), 10) catch {
+            finalize_pooled_failure(ctx);
+            return;
+        };
+        ctx.*.has_total_count = true;
+    }
 
     if (ctx.*.rpc_phase == .metadata and ctx.*.table_embed_metadata) {
         const metadata = parse_relation_metadata(result) orelse {
@@ -8876,7 +9443,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = http.NGX_HTTP_BAD_REQUEST;
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         };
         var qualified_table_buf: [512]u8 = undefined;
@@ -8890,7 +9457,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid filter parameter\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
 
@@ -8899,7 +9466,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid select parameter\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         var select_buf: [MAX_QUERY_SIZE]u8 = undefined;
@@ -8908,7 +9475,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid select parameter\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         var group_by_buf: [MAX_QUERY_SIZE]u8 = undefined;
@@ -8917,7 +9484,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid select parameter\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         var order_specs: [MAX_ORDER_COLUMNS]OrderSpec = undefined;
@@ -8926,7 +9493,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = reject_invalid_order(r);
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         const req_opts = parse_request_options(r);
@@ -8934,7 +9501,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid Range header\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         const pagination_info = effective_read_pagination(r.*.args, req_opts);
@@ -8950,7 +9517,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             select_buf[0..select_result.len],
             group_by_buf[0..group_by_result.len],
             order_specs[0..order_parse.count],
-            pagination_info.pagination,
+            if (ctx.*.inline_count) .{ .limit = null, .offset = null } else pagination_info.pagination,
             r.*.args,
             &select_plan,
             &metadata,
@@ -8958,7 +9525,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid embed parameter\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         };
 
@@ -8966,7 +9533,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Too many SQL parameters\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
 
@@ -8976,7 +9543,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (jwt_result == .unauthorized) {
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, http.NGX_HTTP_UNAUTHORIZED);
+            finish_async_request(r, http.NGX_HTTP_UNAUTHORIZED);
             return;
         }
         if (jwt_result == .failed) {
@@ -8985,7 +9552,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         }
         // queue_jwt_setup_queries set ctx.query = RESET ROLE; append main
         // queries in the correct order: count (if requested) then data.
-        if (read_count_requested(req_opts)) {
+        if (read_count_requested(req_opts) and !ctx.*.inline_count) {
             var count_query_buf: [MAX_QUERY_SIZE]u8 = undefined;
             const count_query_len = build_table_count_query(&count_query_buf, qualified_table, where_buf[0..where_result.len], opts.prefer.count_mode);
             if (!queue_followup_query(ctx, count_query_buf[0..count_query_len])) {
@@ -9020,10 +9587,10 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = if (ctx.*.rpc_body_invalid)
                 send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}")
             else
-                rpc_metadata_not_found_response(r);
+                rpc_resolution_error(r, result, metadata.ambiguous);
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
 
@@ -9031,7 +9598,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = rpc_method_not_allowed_response(r, metadata);
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
 
@@ -9042,7 +9609,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = http.NGX_HTTP_INTERNAL_SERVER_ERROR;
             ctx.*.request = null;
             release_pooled_ctx(ctx, true);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         };
         const resolved_schema = resolve_request_schema(r, loc_conf);
@@ -9050,11 +9617,14 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = http.NGX_HTTP_BAD_REQUEST;
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         };
 
-        var rpc_call: RpcCall = undefined;
+        const rpc_call: *RpcCall = @ptrCast(core.ngz_pcalloc_c(RpcCall, r.*.pool) orelse {
+            finalize_pooled_failure(ctx);
+            return;
+        });
         rpc_call.param_count = 0;
         rpc_call.invalid_params = false;
         rpc_call.function_name = function_name;
@@ -9062,12 +9632,12 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         const body_format = parse_content_type_from_request(r);
         const body_data = get_request_body_slice(r);
         if (body_data) |payload| {
-            parse_rpc_body_params(body_format, payload, r.*.pool, &rpc_call);
+            parse_rpc_body_params(body_format, payload, r.*.pool, rpc_call);
         }
         if (rpc_call.param_count == 0) {
             var rpc_args_buf: [MAX_QUERY_SIZE]u8 = undefined;
             const rpc_args = filter_rpc_query_args_by_metadata(r.*.args, &metadata, true, &rpc_args_buf);
-            parse_rpc_params(rpc_args, &rpc_call);
+            parse_rpc_pairs(rpc_args, rpc_call, true, r.*.pool);
         }
         if (body_data) |payload| {
             if (metadata.single_unnamed_kind != .none and
@@ -9076,44 +9646,59 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = send_unsupported_media_type(r, "{\"message\":\"Request media type does not match the RPC argument\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
-            _ = apply_rpc_single_unnamed_param(metadata, body_format, payload, &rpc_call);
+            _ = apply_rpc_single_unnamed_param(metadata, body_format, payload, rpc_call);
         }
-        if (!rpc_params_match_metadata(&rpc_call, &metadata) or
-            !rpc_query_fits(resolved_schema.name, function_name, &rpc_call))
+        if (!apply_rpc_argument_types(r.*.pool, rpc_call, &metadata) or !rpc_params_match_metadata(rpc_call, &metadata) or
+            !rpc_query_fits(resolved_schema.name, function_name, rpc_call))
         {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
-        collapse_rpc_variadic_param(&rpc_call, &metadata);
-        if (rpc_call.invalid_params or !rpc_query_fits(resolved_schema.name, function_name, &rpc_call)) {
+        collapse_rpc_variadic_param(rpc_call, &metadata);
+        if (rpc_call.invalid_params or !rpc_query_fits(resolved_schema.name, function_name, rpc_call)) {
             const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
 
         ctx.*.next_query_len = 0;
         ctx.*.followup_query_count = 0;
         params_reset(ctx);
+        ctx.*.transaction_read_only = metadata.volatility != .volatile_fn;
+        ctx.*.rpc_scalar = metadata.return_kind == .scalar and loc_conf.*.json_scalar != 0;
+        ctx.*.rpc_setof = metadata.returns_set;
+        ctx.*.rpc_void = metadata.returns_void;
+        ctx.*.emit_range_headers = true;
+        if (opts.prefer.handling == .strict and opts.prefer.max_affected != null and !metadata.returns_set) {
+            const rc = send_protocol_error(r, 400, "PGRST128", "Function must return SETOF or TABLE when max-affected preference is used with handling=strict", null, null);
+            ctx.*.request = null;
+            release_pooled_ctx(ctx, false);
+            finish_async_request(r, rc);
+            return;
+        }
+        ctx.*.inline_count = opts.response_format == .json and opts.prefer.count_mode == .exact;
+        if (ctx.*.inline_count) ctx.*.prefer_count_applied = true;
+        ctx.*.is_write_request = r.*.method == http.NGX_HTTP_POST;
         const jwt_result2 = queue_jwt_setup_queries(ctx, loc_conf);
         if (jwt_result2 == .unauthorized) {
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, http.NGX_HTTP_UNAUTHORIZED);
+            finish_async_request(r, http.NGX_HTTP_UNAUTHORIZED);
             return;
         }
         if (jwt_result2 == .failed) {
             const rc = http.NGX_HTTP_INTERNAL_SERVER_ERROR;
             ctx.*.request = null;
             release_pooled_ctx(ctx, true);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
         // queue_jwt_setup_queries set ctx.query = RESET ROLE.  Append the
@@ -9128,7 +9713,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid filter parameter\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
 
@@ -9138,7 +9723,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid select parameter\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
 
@@ -9148,7 +9733,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid select parameter\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
 
@@ -9158,47 +9743,58 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = reject_invalid_order(r);
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
 
             const pagination_info = effective_read_pagination(read_args, opts);
             ctx.*.response_range_start = pagination_info.range_start;
+            ctx.*.page_limit = pagination_info.pagination.limit orelse 0;
+            ctx.*.has_page_limit = pagination_info.pagination.limit != null;
+            const filter_param_count = ctx.*.param_count;
+            const filter_arena_used = ctx.*.param_arena_used;
 
             const data_query_len = build_rpc_table_query(
                 &rpc_query_buf,
                 resolved_schema.name,
                 function_name,
-                &rpc_call,
+                rpc_call,
                 where_buf[0..where_result.len],
                 select_buf[0..select_result.len],
                 group_by_buf[0..group_by_result.len],
                 order_specs[0..order_parse.count],
-                pagination_info.pagination,
+                if (ctx.*.inline_count) .{ .limit = null, .offset = null } else pagination_info.pagination,
                 ctx,
             );
             if (has_unsafe_param_overflow(ctx, rpc_query_buf[0..data_query_len])) {
                 const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Too many SQL parameters\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
-            if (read_count_requested(opts)) {
+            if (read_count_requested(opts) and !ctx.*.inline_count) {
+                // Count and data use identical placeholder numbering. Rebuild
+                // the RPC arguments after the already-bound WHERE parameters;
+                // never inline an arbitrarily large JSON body into count SQL.
+                ctx.*.param_count = filter_param_count;
+                ctx.*.rpc_body_param_index = 0;
+                ctx.*.param_arena_used = filter_arena_used;
                 var count_query_buf: [MAX_QUERY_SIZE]u8 = undefined;
                 const count_query_len = build_rpc_table_count_query(
                     &count_query_buf,
                     opts.prefer.count_mode,
                     resolved_schema.name,
                     function_name,
-                    &rpc_call,
+                    rpc_call,
                     where_buf[0..where_result.len],
+                    ctx,
                 );
                 if (!queue_followup_query(ctx, count_query_buf[0..count_query_len])) {
                     const rc = http.NGX_HTTP_INTERNAL_SERVER_ERROR;
                     ctx.*.request = null;
                     release_pooled_ctx(ctx, true);
-                    http.ngx_http_finalize_request(r, rc);
+                    finish_async_request(r, rc);
                     return;
                 }
                 ctx.*.rpc_phase = .count;
@@ -9209,23 +9805,23 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
                 const rc = http.NGX_HTTP_INTERNAL_SERVER_ERROR;
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, true);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
         } else {
-            const call_len = build_rpc_call_query(&rpc_query_buf, resolved_schema.name, function_name, &rpc_call, ctx);
+            const call_len = build_rpc_call_query(&rpc_query_buf, resolved_schema.name, function_name, rpc_call, ctx);
             if (has_unsafe_param_overflow(ctx, rpc_query_buf[0..call_len])) {
                 const rc = send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Too many SQL parameters\"}");
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, false);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
             if (!queue_followup_query(ctx, rpc_query_buf[0..call_len])) {
                 const rc = http.NGX_HTTP_INTERNAL_SERVER_ERROR;
                 ctx.*.request = null;
                 release_pooled_ctx(ctx, true);
-                http.ngx_http_finalize_request(r, rc);
+                finish_async_request(r, rc);
                 return;
             }
             ctx.*.rpc_phase = .call;
@@ -9245,15 +9841,17 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         const rc = send_not_acceptable(r, "{\"message\":\"None of these media types are available\"}");
         ctx.*.request = null;
         release_pooled_ctx(ctx, false);
-        http.ngx_http_finalize_request(r, rc);
+        finish_async_request(r, rc);
         return;
     }
 
     if (opts.singular_object and ntuples != 1) {
-        const rc = send_not_acceptable(r, "{\"message\":\"JSON object requested, multiple (or no) rows returned\"}");
+        var detail: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(&detail, "The result contains {d} rows", .{ntuples}) catch unreachable;
+        const rc = send_protocol_error(r, 406, "PGRST116", "Cannot coerce the result to a single JSON object", text, null);
         ctx.*.request = null;
         release_pooled_ctx(ctx, false);
-        http.ngx_http_finalize_request(r, rc);
+        finish_async_request(r, rc);
         return;
     }
 
@@ -9261,7 +9859,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (enforce_max_affected(r, opts, ntuples)) |rc| {
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         }
     }
@@ -9269,13 +9867,13 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     var response_len: usize = 0;
     var content_type: [*:0]const u8 = "application/json";
     const scalar_conf = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module));
-    const json_scalar = scalar_conf != null and scalar_conf.?.*.json_scalar == 1 and
+    const json_scalar = !ctx.*.canonical_json and scalar_conf != null and scalar_conf.?.*.json_scalar == 1 and
         is_rpc_endpoint(r.*.uri) and ntuples == 1 and nfields == 1 and
         (pgFtype(result, 0) == 114 or pgFtype(result, 0) == 3802) and opts.response_format == .json;
     // JSON scalar RPCs already contain serialized JSON. Allocate its actual
     // byte length without the table formatter's escaping/wrapping estimate.
     const scalar_length: usize = if (json_scalar) (if (pgGetisnull(result, 0, 0) != 0) 4 else @intCast(pgGetlength(result, 0, 0))) else 0;
-    const response_buffer_size = if (json_scalar) scalar_response_buffer_size(scalar_length, scalar_conf.?.*.json_scalar_max_size) else estimate_response_buffer_size(
+    const response_buffer_size = if (ctx.*.inline_count) canonical_json_size(result, 1, true) else if (ctx.*.canonical_json) canonical_json_size(result, ntuples, opts.singular_object or (ctx.*.rpc_scalar and !ctx.*.rpc_setof)) else if (json_scalar) scalar_response_buffer_size(scalar_length, scalar_conf.?.*.json_scalar_max_size) else estimate_response_buffer_size(
         result,
         ntuples,
         nfields,
@@ -9284,23 +9882,30 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         &ctx.*.raw_json_field_lens,
         ctx.*.raw_json_field_count,
     );
-    const response_limit = if (json_scalar) scalar_conf.?.*.json_scalar_max_size else MAX_JSON_SIZE;
+    const response_limit = if (is_rpc_endpoint(r.*.uri) and scalar_conf != null) scalar_conf.?.*.json_scalar_max_size else MAX_JSON_SIZE;
     if (response_buffer_size > response_limit) {
         const rc = send_json_error(r, http.NGX_HTTP_BAD_GATEWAY, "{\"message\":\"PostgreSQL response exceeds pgrest serialization limit\"}");
         ctx.*.request = null;
         release_pooled_ctx(ctx, false);
-        http.ngx_http_finalize_request(r, rc);
+        finish_async_request(r, rc);
         return;
     }
     const response_body_buf = buf.ngx_create_temp_buf(r.*.pool, response_buffer_size) orelse {
         ctx.*.request = null;
         release_pooled_ctx(ctx, true);
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        finish_async_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     };
     const response_storage = response_body_buf.*.last[0..response_buffer_size];
 
-    if (json_scalar) {
+    if (ctx.*.canonical_json) {
+        response_len = format_canonical_json(result, if (ctx.*.inline_count) 1 else ntuples, response_storage, ctx.*.inline_count or opts.singular_object or (ctx.*.rpc_scalar and !ctx.*.rpc_setof));
+        if (opts.singular_object) content_type = "application/vnd.pgrst.object+json";
+        if (ctx.*.rpc_void) {
+            ctx.*.write_status = 204;
+            ctx.*.write_send_body = false;
+        }
+    } else if (json_scalar) {
         if (pgGetisnull(result, 0, 0) != 0) {
             @memcpy(response_storage[0..4], "null");
             response_len = 4;
@@ -9323,17 +9928,71 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
             const rc = send_not_acceptable(r, "{\"message\":\"application/octet-stream requires exactly one row and one column\"}");
             ctx.*.request = null;
             release_pooled_ctx(ctx, false);
-            http.ngx_http_finalize_request(r, rc);
+            finish_async_request(r, rc);
             return;
         },
         error.ResponseTooLarge => {
             ctx.*.request = null;
             release_pooled_ctx(ctx, true);
-            http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+            finish_async_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         },
     };
 
+    if (ctx.*.has_total_count and ctx.*.response_range_start > @as(usize, @intCast(@max(ctx.*.total_count, 0)))) {
+        var detail: [160]u8 = undefined;
+        const details = std.fmt.bufPrint(&detail, "An offset of {d} was requested, but there are only {d} rows.", .{ ctx.*.response_range_start, ctx.*.total_count }) catch unreachable;
+        const body = json_error_body(r, "PGRST103", "Requested range not satisfiable", details, null) orelse {
+            finalize_pooled_failure(ctx);
+            return;
+        };
+        const error_buf = buf.ngx_create_temp_buf(r.*.pool, body.len) orelse {
+            finalize_pooled_failure(ctx);
+            return;
+        };
+        @memcpy(error_buf.*.pos[0..body.len], body);
+        ctx.*.response_buf = error_buf;
+        ctx.*.response_len = body.len;
+        ctx.*.write_status = 416;
+        ctx.*.response_content_type = "application/json";
+    } else {
+        ctx.*.response_buf = response_body_buf;
+        ctx.*.response_len = response_len;
+        ctx.*.response_content_type = content_type;
+    }
+    ctx.*.response_rows = ntuples;
+    ctx.*.transaction_phase = .settings;
+    _ = set_active_query(ctx, "SELECT current_setting('response.status',true), current_setting('response.headers',true)");
+    if (!start_pooled_query(ctx, ctx.*.pool_conn.?)) finalize_pooled_failure(ctx);
+}
+
+fn finish_async_request(r: [*c]ngx_http_request_t, rc: ngx_int_t) void {
+    const connection = r.*.connection;
+    http.ngx_http_finalize_request(r, rc);
+    http.ngx_http_run_posted_requests(connection);
+}
+
+fn send_committed_response(ctx: *PgRequestCtx, opts: RequestOptions) void {
+    const r = ctx.*.request orelse return;
+    if (ctx.*.response_settings_error != .none) {
+        const status_setting = ctx.*.response_settings_error == .status;
+        const rc = send_protocol_error(r, 500, if (status_setting) "PGRST112" else "PGRST111", if (status_setting) "response.status guc must be a valid status code" else "response.headers guc must be a JSON array composed of objects with a single key and a string value", null, null);
+        ctx.*.request = null;
+        release_pooled_ctx(ctx, false);
+        const connection = r.*.connection;
+        http.ngx_http_finalize_request(r, rc);
+        http.ngx_http_run_posted_requests(connection);
+        return;
+    }
+    if (!append_database_response_headers(ctx)) {
+        finalize_pooled_failure(ctx);
+        return;
+    }
+    const response_body_buf = ctx.*.response_buf;
+    const response_len = ctx.*.response_len;
+    const ntuples = ctx.*.response_rows;
+    const content_type = ctx.*.response_content_type;
+    if (ctx.*.response_override_status != 0) ctx.*.write_status = ctx.*.response_override_status;
     // Null ctx.request before releasing the pool connection.  This preserves the
     // main->count hold so that nginx's subrequest cleanup (r->main->count-- after
     // the post_subrequest callback returns) is what drives the count to zero rather
@@ -9481,6 +10140,22 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_msec_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(ngx_pgrest_loc_conf_t, "timeout"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("pgrest_pool_acquisition_timeout"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_msec_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "pool_acquisition_timeout"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("pgrest_pool_queue_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_num_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "pool_queue_size"),
         .post = null,
     },
     ngx_command_t{
@@ -9725,12 +10400,12 @@ test "unsafe parameter overflow is detected when earlier placeholders already ex
     params_reset(&ctx);
 
     var where_buf: [4096]u8 = undefined;
-    var args_buf: [1024]u8 = undefined;
+    var args_buf: [4096]u8 = undefined;
     var pos: usize = 0;
     const prefix = "name=in.(";
     @memcpy(args_buf[pos..][0..prefix.len], prefix);
     pos += prefix.len;
-    for (0..65) |i| {
+    for (0..MAX_PARAMS + 1) |i| {
         if (i > 0) {
             args_buf[pos] = ',';
             pos += 1;
@@ -9871,7 +10546,7 @@ test "build_limited_write_query renders update with limit and order" {
     );
 }
 
-test "collapse_rpc_variadic_param merges repeated variadic values into ARRAY syntax" {
+test "collapse_rpc_variadic_param binds array input without assuming its element type" {
     var rpc_call: RpcCall = undefined;
     rpc_call.function_name = "plus_one";
     rpc_call.param_count = 3;
@@ -9891,8 +10566,8 @@ test "collapse_rpc_variadic_param merges repeated variadic values into ARRAY syn
 
     try expectEqual(@as(usize, 2), rpc_call.param_count);
     try expectEqualStrings("v", rpc_call.params[0].name);
-    try expectEqualStrings("ARRAY[1,2]", rpc_call.params[0].value);
-    try expect(rpc_call.params[0].is_raw);
+    try expectEqualStrings("{\"1\",\"2\"}", rpc_call.params[0].value);
+    try expect(!rpc_call.params[0].is_raw);
     try expectEqualStrings("other", rpc_call.params[1].name);
 }
 
@@ -10031,18 +10706,44 @@ test "estimated_json_string_size with escapes" {
     try expectEqual(@as(usize, 9), estimated_json_string_size("a\nb\tc"));
 }
 
-test "application SQLSTATE contract is narrow and does not disclose SQL errors" {
-    try std.testing.expectEqual(@as(ngx_uint_t, 422), application_error("PT422").?.status);
-    try std.testing.expectEqual(@as(ngx_uint_t, 401), application_error("PT401").?.status);
-    try std.testing.expect(application_error("PT200") == null);
-    try std.testing.expect(application_error("PT599") == null);
-    try std.testing.expect(application_error("P0001") == null);
-}
-
 test "scalar JSON sizing uses actual bytes and enforces its configured bound" {
     try expectEqual(@as(usize, MIN_RESPONSE_BUFFER_SIZE), scalar_response_buffer_size(4, MAX_JSON_SIZE));
     try expectEqual(@as(usize, MAX_JSON_SIZE), scalar_response_buffer_size(MAX_JSON_SIZE, MAX_JSON_SIZE));
     try expectEqual(@as(usize, MAX_JSON_SIZE + 1), scalar_response_buffer_size(MAX_JSON_SIZE + 1, MAX_JSON_SIZE));
     try expectEqual(@as(usize, 600000), scalar_response_buffer_size(600000, 2 * 1024 * 1024));
     try expectEqual(@as(usize, 2 * 1024 * 1024 + 1), scalar_response_buffer_size(2 * 1024 * 1024 + 1, 2 * 1024 * 1024));
+}
+
+test "RPC query arguments decode once and retain PostgreSQL text input semantics" {
+    const cases = [_][2][]const u8{
+        .{ "value=a%2Bb", "a+b" },         .{ "value=a+b", "a b" },
+        .{ "value=%2520", "%20" },
+        .{ "value=%E4%B8%AD%E6%96%87", "中文" },
+        .{ "value=123", "123" },           .{ "value=true", "true" },
+        .{ "value=null", "null" },         .{ "value=", "" },
+        .{ "value=%", "%" },               .{ "value=%ZZ", "%ZZ" },
+        .{ "%76alue=a%26b%3Dc", "a&b=c" },
+    };
+    for (cases) |case| {
+        var call: RpcCall = undefined;
+        call.param_count = 0;
+        call.invalid_params = false;
+        parse_rpc_params(.{ .data = @constCast(case[0].ptr), .len = case[0].len }, &call);
+        try expect(!call.invalid_params);
+        try expectEqual(@as(usize, 1), call.param_count);
+        try expectEqualStrings("value", call.params[0].name);
+        try expectEqualStrings(case[1], call.params[0].value);
+        try expect(!call.params[0].is_numeric and !call.params[0].is_boolean and !call.params[0].is_null);
+    }
+}
+
+test "RPC query parser rejects identifier NUL and admission overflow" {
+    const cases = [_][]const u8{ "va%00lue=x", "=x", "value=" ++ "a" ** 8193 };
+    for (cases) |case| {
+        var call: RpcCall = undefined;
+        call.param_count = 0;
+        call.invalid_params = false;
+        parse_rpc_params(.{ .data = @constCast(case.ptr), .len = case.len }, &call);
+        try expect(call.invalid_params);
+    }
 }

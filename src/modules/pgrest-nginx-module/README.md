@@ -2,6 +2,13 @@
 
 A PostgREST-like nginx module written in Zig that provides a RESTful API for PostgreSQL databases.
 
+The current target is interchangeable native/PostgREST execution for database
+API reads and commands, without per-RPC routing exceptions. See the
+[2026-10-05 compatibility audit](COMPATIBILITY.md) for the tested app inventory,
+implemented fixes, regression evidence and remaining general feature gaps.
+The audit distinguishes current app API interchangeability from universal
+PostgREST feature coverage; it supersedes older broad parity claims below.
+
 ## Module Layout
 
 The pgrest implementation is no longer a single growing file. The current split keeps nginx-facing module glue in `ngx_http_pgrest.zig` and moves reusable logic into focused submodules:
@@ -9,7 +16,8 @@ The pgrest implementation is no longer a single growing file. The current split 
 - `ngx_http_pgrest.zig` - nginx module entrypoint, directives, request orchestration, pooled execution glue
 - `pgrest_auth.zig` - JWT extraction/validation and query helpers with Zig tests
 - `pgrest_query.zig` - SQL grammar, table query builders, and write-query helpers with Zig tests
-- `pgrest_rpc.zig` - RPC metadata/query-shaping helpers with Zig tests
+- `pgrest_rpc.zig` - legacy standalone RPC helpers with Zig tests; the pooled handler uses the active implementations in `ngx_http_pgrest.zig`
+- `pgrest_protocol.zig` - PostgREST SQLSTATE/status mapping with Zig tests
 - `pgrest_sql.zig` - shared SQL identifier and literal escaping
 
 This split is intentionally mechanical so future batches can grow one concern without dragging the whole module into context.
@@ -20,9 +28,9 @@ This split is intentionally mechanical so future batches can grow one concern wi
 
 | Area | Limit | Source |
 |---|---:|---|
-| SQL query buffer | `4096` bytes | `pgrest_query.zig:MAX_QUERY_SIZE` |
+| SQL query buffer | `16384` bytes | active handler `MAX_QUERY_SIZE` |
 | Table response JSON formatting buffer | `65536` bytes | `ngx_http_pgrest.zig:MAX_JSON_SIZE` |
-| SQL parameter arena | `8192` bytes total | `ngx_http_pgrest.zig:MAX_PARAM_BUFFER` |
+| SQL parameter arena | `8192` bytes inline, request-pool spill for larger bound values; 256 parameters | active handler |
 | Write columns per row | `32` | `pgrest_query.zig:MAX_COLUMNS` |
 | Select columns | `32` | `pgrest_query.zig:MAX_SELECT_COLUMNS` |
 | Order columns | `8` | `pgrest_query.zig:MAX_ORDER_COLUMNS` |
@@ -31,13 +39,13 @@ This split is intentionally mechanical so future batches can grow one concern wi
 | JSON/form field name scratch | `256` bytes per field name | `pgrest_query.zig:name_buf`, `ngx_http_pgrest.zig` write-field storage |
 | Query/filter field value scratch | `1024` bytes per field value | `pgrest_query.zig:value_buf` |
 | JSON parser scratch for single-object write bodies | `< 4096` body bytes | `ngx_http_pgrest.zig` object-body parsing path |
-| JSON parser scratch for RPC JSON bodies | `< 4096` body bytes | `ngx_http_pgrest.zig` RPC body parsing path |
+| RPC JSON/form body size | nginx `client_max_body_size`; request-pool allocations | active RPC parser (no 4k body ceiling) |
 | JSON parser scratch for bulk JSON array writes | `< 8192` body bytes | `ngx_http_pgrest.zig` bulk-array parsing path |
 | CSV single-row field value | `1024` bytes per field | `ngx_http_pgrest.zig:MAX_CSV_VALUE_LEN` |
-| RPC parameter count | `16` | `pgrest_rpc.zig:MAX_RPC_PARAMS` |
-| RPC parameter encoded-value scratch | `2048` bytes | `pgrest_rpc.zig:RpcParam.value_buf` |
-| RPC variadic parameter name scratch | `128` bytes | `pgrest_rpc.zig:variadic_param_name_buf` |
-| RPC input-parameter names scratch | `256` bytes | `pgrest_rpc.zig:input_param_names_buf` |
+| RPC parameter count | `100` (standard PostgreSQL function argument limit) | active handler `MAX_RPC_PARAMS` |
+| RPC decoded query/form values | 256 bytes inline; larger values allocated from the request pool | active handler `RpcParam` |
+| RPC variadic parameter name scratch | `128` bytes | active handler metadata |
+| RPC input-parameter names scratch | `8192` bytes | active handler metadata |
 
 Important nuance:
 
@@ -119,7 +127,7 @@ location /api/ {
 
 1. Client sends request with JWT containing a `role` claim
 2. nginz validates the JWT signature using `pgrest_jwt_secret`
-3. If valid, nginz extracts the role from the JWT and executes `SET ROLE '<role>'`
+3. If valid, nginz extracts the role from the JWT and executes transaction-local `SET LOCAL ROLE '<role>'`
 4. If invalid or missing, nginz uses `pgrest_anon_role`
 5. PostgreSQL RLS policies now apply based on the current role
 
@@ -366,7 +374,7 @@ curl -X POST "http://localhost/rpc/create_order" \
 
 ### Array Parameters
 
-pgrest supports JSON arrays as function parameters. Arrays are automatically converted to PostgreSQL `ARRAY[...]` syntax:
+pgrest supports JSON arrays as function parameters. PostgreSQL decodes the bound JSON document using each declared argument type, preserving both SQL arrays and JSON arrays:
 
 ```bash
 # Array of numbers
@@ -399,9 +407,9 @@ $$ LANGUAGE SQL;
 
 Current metadata-backed RPC notes:
 
-- `GET` and `HEAD` are currently allowed only when the function metadata resolves to non-`VOLATILE`; `VOLATILE` functions return `405` with `Allow: OPTIONS,POST`.
+- `GET` and `HEAD` execute in a read-only transaction, including `VOLATILE` functions. PostgreSQL rejects actual writes. POST is read-only for stable/immutable functions and read-write for volatile functions.
 - Single unnamed `json/jsonb`, `text`, `xml`, and `bytea` parameters now use positional RPC calls from matching request-body media types.
-- Variadic RPC parameters now collapse repeated GET query parameters and repeated `application/x-www-form-urlencoded` body parameters into one PostgreSQL `ARRAY[...]` argument when the function metadata marks that parameter as variadic.
+- Variadic RPC parameters now collapse repeated GET query parameters and repeated `application/x-www-form-urlencoded` body parameters into one bound PostgreSQL array input when the function metadata marks that parameter as variadic.
 - Table-valued/composite-return RPC functions now reuse the table read grammar for `select`, filters, ordering, and pagination, while separating true function arguments from read-shaping query parameters.
 - Named JSON/form RPC calls continue to use named PostgreSQL arguments, and `Prefer: params=single-object` still uses the existing named wrapper behavior.
 
@@ -1314,7 +1322,7 @@ Error responses:
 - ✅ **Singular object responses** - Accept: application/vnd.pgrst.object+json for single-row object format
 - ✅ **Stripped nulls** - Accept: application/vnd.pgrst.array+json;nulls=stripped to omit null fields
 - ✅ **Array parameters** - JSON arrays automatically converted to PostgreSQL ARRAY[] syntax in RPC calls
-- ✅ **RPC volatility gating** - RPC GET/HEAD now respects metadata-backed volatility checks and rejects `VOLATILE` functions with `405`
+- ✅ **RPC transaction mode** - GET/HEAD and stable/immutable POST use read-only transactions; volatile POST uses read-write.
 - ✅ **Single unnamed RPC parameters** - matching `json/jsonb`, `text`, `xml`, and `bytea` single-unnamed-parameter functions now use positional body binding
 - ✅ **Variadic repeated parameters** - repeated GET and form-urlencoded RPC parameters now collapse into one variadic `ARRAY[...]` argument when metadata marks the target parameter as variadic
 - ✅ **Table-valued RPC read grammar** - composite/table-returning RPC functions now support `select`, filters, ordering, and pagination
@@ -1335,9 +1343,11 @@ Error responses:
 | Directive | Syntax | Context | Default | Description |
 |-----------|--------|---------|---------|-------------|
 | `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. Pools are worker-local and keyed by the complete connection string plus pool size. Distinct databases, hosts or credentials use distinct pools; up to 16 distinct pool configurations are supported per worker. |
-| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum connections (1–32) per distinct connection-string/size pool, per worker. A saturated pool immediately returns 503; there is no wait queue. Inherited by nested locations. |
-| `pgrest_json_scalar_max_size` | `pgrest_json_scalar_max_size size` | `location` | `64k` | Bound a scalar JSON RPC response by its actual serialized bytes; accepts 512 bytes–16m. Allocate from the request pool. Match the subrequest target's output buffer for njs callers, or set that buffer at `http` scope. Table formatting retains its 64k limit. |
-| `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `off` | Return a single JSON/JSONB scalar RPC column as the JSON value itself. Off preserves the ordinary wrapped result shape. |
+| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum connections (1–32) per distinct connection-string/size pool, per worker. Saturated pools queue requests with bounded acquisition time. Inherited by nested locations. |
+| `pgrest_json_scalar_max_size` | `pgrest_json_scalar_max_size size` | `location` | `64k` | Bound a JSON RPC response (including explicit legacy wrapping) by its actual serialized bytes; accepts 512 bytes–16m. Allocate from the request pool. Match the subrequest target's output buffer for njs callers, or set that buffer at `http` scope. Table formatting retains its 64k limit. |
+| `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `on` | PostgREST scalar/SETOF JSON shapes using PostgreSQL type-aware serialization. `off` retains the legacy scalar row wrapper and is not the compatibility profile. |
+| `pgrest_pool_acquisition_timeout` | `pgrest_pool_acquisition_timeout 10s` | `location` | `10s` | Maximum queue wait, separate from database I/O. Expiry returns HTTP 504/PGRST003 before SQL is submitted. |
+| `pgrest_pool_queue_size` | `pgrest_pool_queue_size 128` | `location` | `128` | Waiter admission cap (0–4096) against the shared worker-local DSN/size queue. Use consistent caps across locations sharing a pool. Full/disabled queues return 504/PGRST003 immediately. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
 | `pgrest_jwt_secret` | `pgrest_jwt_secret "secret"` | `location` | — | HS256 secret for JWT signature validation. When set, tokens are validated before role extraction. |
@@ -1373,12 +1383,15 @@ an njs parent asleep until the client disconnects. The Carve regression denies
 the audit-chunk function grant, checks that provider dispatch stops and HTTP
 fails promptly, then forces a SQL timeout and checks readiness recovery.
 
-Named JSON object arguments are bound as JSON text for JSON/JSONB parameters;
-strings and encoded nested objects above 2048 bytes, more than 16 named
-parameters, and JSON RPC bodies at or above 4096 bytes are rejected instead of
-silently truncating. Application SQLSTATE values PT400/401/403/404/409/422/429/503
-map to their HTTP statuses with generic error text; unrecognized states remain
-server errors.
+RPC signature selection uses names, required/default arguments and ambiguity.
+JSON arguments are decoded by PostgreSQL's catalog types using the original
+bound document, preserving bigint/decimal precision, arrays, objects and null.
+Query/form components are decoded once, duplicates use the last value except
+variadic inputs, and larger values use the nginx request pool. The 16.4 query
+value NUL-termination behavior is deliberately matched; NUL identifiers fail.
+SQL errors now expose the PostgREST code/message/details/hint contract and
+SQLSTATE status mapping, including PT statuses and structured PGRST errors.
+This changes the previous sanitized error contract: review before image rollout.
 
 ### Scalar JSON response regression tests
 
@@ -1392,6 +1405,8 @@ overrides, disabled scalar mode, ordinary result shapes, response negotiation,
 invalid directive values/arguments/contexts, and connection-pool recovery after
 repeated oversized responses. njs checks verify complete large responses and
 propagated errors followed by successful requests.
+The configured JSON RPC response bound also applies when scalar unwrapping is
+explicitly disabled. Ordinary table responses retain their separate 64k bound.
 
 The container suite reuses `pgrest-nginz-test` on port 5432, with its own temporary
 database and role. UTF-8 boundary checks use real PostgreSQL because the existing
@@ -1424,15 +1439,15 @@ bounded troubleshooting window.
 | Category | Status | Notes |
 |----------|--------|-------|
 | Tables / URL grammar | Partial | Logical ops, advanced operators, escaping, aliasing, casting, JSON paths supported. Embedding grammar beyond direct FK is partial. |
-| Media types / representation | Partial | JSON, CSV, plain text, XML, and constrained octet-stream supported. Custom media handlers are out of scope. |
-| RPC | Partial | Volatility gating, unnamed params, variadics, table-valued return with filtering/order/pagination supported. RPC embedding is out of scope. |
+| Media types / representation | Partial | JSON, CSV, plain text, XML, and constrained octet-stream supported. Custom media handlers remain unimplemented. |
+| RPC | Partial | Transaction mode, unnamed params, variadics, table-valued return with filtering/order/pagination supported. RPC embedding remains unimplemented. |
 | Pagination / count | Partial | Range headers, `Prefer: count=exact|planned|estimated`, planner-backed estimate counts for table reads and table-valued RPC reads. Embedding counts remain out of scope. |
-| Prefer header | Partial | `return`, `handling`, `max-affected`, `missing=default`, `resolution` supported. `tx=commit/rollback` is out of scope. |
+| Prefer header | Partial | `return`, `handling`, `max-affected`, `missing=default`, `resolution` supported. `tx=commit/rollback` remains unimplemented. |
 | Schema / profiles | Implemented | `pgrest_schemas` allowlist, `Accept-Profile`, `Content-Profile`, default schema selection. |
-| Bulk writes / upsert | Partial | Bulk JSON/CSV inserts, `columns`, `missing=default`, explicit upsert, limited update/delete supported. Default PK upsert inference is out of scope. |
-| Embedding / relationships | Partial | One-level to-one/to-many, many-to-many, nested embedding, `!inner`, `!fk` disambiguation supported. Spread syntax, null embed filters, mutation-time embedding are out of scope. |
-| Aggregates / computed fields | Partial | `sum`, `avg`, `min`, `max`, `count`, grouped queries, computed field select/filter/order supported. Aggregate ordering and `HAVING` are out of scope. |
-| OPTIONS / CORS / OpenAPI | Partial | Basic `OPTIONS`, CORS simple/preflight, minimal OpenAPI root documents supported. Full OpenAPI customization is out of scope. |
+| Bulk writes / upsert | Partial | Bulk JSON/CSV inserts, `columns`, `missing=default`, explicit upsert, limited update/delete supported. Default PK upsert inference remains unimplemented. |
+| Embedding / relationships | Partial | One-level to-one/to-many, many-to-many, nested embedding, `!inner`, `!fk` disambiguation supported. Spread syntax, null embed filters, mutation-time embedding remain unimplemented. |
+| Aggregates / computed fields | Partial | `sum`, `avg`, `min`, `max`, `count`, grouped queries, computed field select/filter/order supported. Aggregate ordering and `HAVING` remain unimplemented. |
+| OPTIONS / CORS / OpenAPI | Partial | Basic `OPTIONS`, CORS simple/preflight, minimal OpenAPI root documents supported. Full OpenAPI customization remains unimplemented. |
 | JWT auth | Implemented | Signature validation, `exp`/`iat`/`nbf` enforcement, role claim extraction, passthrough to PostgreSQL. |
 | Execution-path parity | Partial | The active implementation is the pooled/nonblocking path. Connection/runtime failure coverage, pooled-state isolation, and bounded parameterized-query execution are in place on the active path. |
 
@@ -1441,7 +1456,7 @@ bounded troubleshooting window.
 This section documents the Batch 12 hardening fixes that are now in place.
 
 - **JWT validation hardening** — Tokens with invalid format, invalid signature, expired `exp`, future `iat`, or not-yet-valid `nbf` now return `401 Unauthorized` instead of falling back to the anonymous role.
-- **Error response parity** — All client-facing errors now use the consistent `{"message":"..."}` shape. Server errors also use `{"message":"..."}` for consistency.
+- **Database error responses** — The candidate follows PostgREST SQLSTATE/status and code/message/details/hint semantics. See the compatibility audit for migration implications and measured coverage.
 - **Runtime and transport error classification** — PostgreSQL syntax errors, undefined tables/functions, constraint violations, insufficient-privilege failures, unreachable hosts, DNS failures, connection resets, and timed-out pooled requests now return explicit HTTP status/message pairs instead of collapsing into a generic `500 Query failed`.
 - **Malformed Range header rejection** — Invalid `Range` headers (missing dash, dash at start/end) now return `400 Bad Request` with a clear message instead of being silently ignored.
 - **Embedded resource format boundary** — Non-JSON response formats for embedded reads are explicitly rejected with `406 Not Acceptable` and a clear message.
@@ -1453,7 +1468,6 @@ This section documents the Batch 12 hardening fixes that are now in place.
 
 - **Parameterized-query limits** - String filter/RPC/write values use bounded positional parameters on the active path. Requests that exceed the current parameter budget fail with `400 Bad Request` instead of degrading into mixed placeholder/raw SQL execution.
 - **Single table operations** - CRUD on single tables only (use RPC for JOINs/complex queries)
-- **Simple query building** - Complex filters use AND logic only
 - **Binary format** - application/octet-stream currently requires exactly one row and one column on output
 - **Request body media types** - non-JSON formats are intentionally mapped to narrow write/RPC contracts rather than inferred automatically
 
@@ -1462,7 +1476,6 @@ This section documents the Batch 12 hardening fixes that are now in place.
 - Relationship handling (embedded resources, foreign key expansion)
 - Bulk operations (multiple INSERT/UPDATE/DELETE)
 - Materialized view support
-- Custom response headers per endpoint
 - Rate limiting and caching headers
 - Request/response compression
 - GraphQL support
@@ -1670,3 +1683,146 @@ The current pgrest module already has the right broad shape for strong simple-qu
 ### Engineering Audit Verdict (2026-07-12)
 
 **Verdict: S0/S1 CORE FIXED; S2 POOL ENVELOPE MEASURED.** Per-worker pools are isolated by backend and have explicit lifecycle/capacity behavior. pgrest serializes directly into its nginx output buffer and rejects representations above its bound. The pool remains 16 connections by default but can be configured up to 32. A ReleaseSmall small-page matrix showed that 32 removes concurrency-32 pool-exhaustion 503s (200/200 correct), while peak throughput remained at concurrency 8; larger pools are therefore an explicit deployment tuning choice, not a new default. The 124-case focused suite is green.
+
+### Bounded acquisition queue study (2026-10-05; historical proposal)
+
+The candidate now implements bounded waiting; use the directives above and
+[the current audit](COMPATIBILITY.md). The proposal and timings below describe
+the original beta binary and are retained as historical comparison.
+
+Reviewed nginz `5a3d854` and the local PostgREST checkout at
+`/home/kaiwu/Documents/github/postgrest`, revision `d42ae9d5`. This study does not
+add directives or change module behavior. Carve and Duell beta currently opt into
+six public database connections per worker, with two nginx workers shared by
+both apps. Each app therefore has 12 public slots, distributed between workers.
+
+**How PostgREST waits.** `PostgREST/AppState.hs` creates one pool in application
+state; request threads in that process share it. `PostgREST/AppState/Pool.hs`
+passes size, acquisition timeout, idle timeout and lifetime into Hasql. This
+checkout compiles `src/hasql/Hasql/Pool.hs` (see `postgrest.cabal`), not the old
+vendor backup. Its `use` function atomically chooses an idle connection, reserves
+capacity to open a new one, or waits for capacity/timeout using STM `retry` and
+`registerDelay`. Returning a connection writes it to the available-connection
+`TQueue`, waking blocked transactions without polling. That queue stores idle
+connections; it is not an explicit FIFO of waiting HTTP requests. The inspected
+implementation has no separate maximum-waiter setting or explicit request FIFO
+contract. Acquisition timeout does not bound the SQL session or all subsequent
+connection-establishment work.
+
+The inspected configuration defaults are 10 connections, 10 seconds acquisition
+timeout, 30 seconds idle timeout and 1,800 seconds lifetime. Acquisition expiry
+maps to HTTP 504 / `PGRST003` in `PostgREST/Error.hs`, also documented in the
+[PostgREST connection-pool reference](https://postgrest.org/en/stable/references/connection_pool.html).
+Recycling only idle/returned connections keeps active work intact. One process's
+shared Haskell pool does not imply sharing libpq connections between nginx
+worker processes.
+
+**What pgrest needs.** `start_pooled_request` currently returns 503 at
+`getFreeSlot() orelse` when every slot is occupied. Add an opt-in FIFO wait list
+to each existing worker-local `PgConnPool`, with both a waiter count cap and an
+absolute acquisition deadline. Retain immediate rejection by default. Candidate
+directive names and initial experiment values (these do not exist yet):
+
+```nginx
+pgrest_pool_size 6;
+pgrest_queue_size 32;
+pgrest_queue_timeout 250ms;
+```
+
+Queue overflow should retain 503; acquisition expiry should return a distinct
+JSON 504. A queued request has not submitted SQL. Never automatically retry SQL
+or payments after dispatch. Keep the queue deadline separate from the existing
+PostgreSQL I/O timeout, which is rearmed as read/write phases change. Preserve
+JWT/SQL ownership and the direct native path; no njs, Redis or client reporting
+is needed. Locations sharing a DSN/size pool must agree on queue policy, validated
+at configuration time. Do not add queue settings to the pool identity and
+silently multiply database connections.
+
+**Lifecycle work is essential.** Implement explicit waiting/dispatched/finished
+states, an nginx request-lifetime hold while queued, and cleanup that removes
+the waiter, its timer and any posted resume event exactly once. Refactor
+`release_pooled_ctx`: its current hold-release logic is inside the
+`ctx.pool_conn != null` branch, which cannot release a connectionless waiter's
+hold. Preserve main-request and subrequest completion contracts, including njs
+parent wakeups. On release or failed-connection cleanup, reserve available
+capacity for the oldest live waiter and post its resume event; do not recursively
+start it inside `finalize_pg_response`. The existing
+`maybe_process_ready_wait_read` comment records why synchronous reentry can free
+requests mid-stack. Use cycle-lifetime logging for persistent pool events.
+
+Cancellation before dispatch must remove the request without executing SQL.
+Once SQL is dispatched, a disconnected client cannot prove a write did not
+commit. Cover deadline/slot-release races, aborted parents and queued
+subrequests. Bound wakeups per event-loop turn, and let old worker generations
+drain within queue deadlines during reload. Do not share socket handles or
+request pointers through shared memory to solve uneven worker distribution.
+
+**Budget and evidence.** With six active slots, 20 requests evenly split across
+workers can run in two waves instead of rejecting the second wave; 20 on one
+worker require four waves. For a warm pool and a hypothetical 20 ms slot-holding
+time, the final wave starts around 20 ms or 60 ms respectively. These are
+illustrations, not beta measurements. Slow queries and sustained overload still
+reach the deadline or queue cap. Waiting retains HTTP state and bodies, and
+`PgRequestCtx` already includes six 4 KiB query buffers plus an 8 KiB parameter
+arena; cap memory as well as wait time. Consider lazy query/context allocation
+only after the acquisition lifecycle is correct.
+
+Before enabling queueing, test queue-disabled behavior, FIFO/no-overtaking,
+queue overflow, hard acquisition expiry, disconnects, SQL errors, connection
+failures, repeated main/subrequest completion, JWT isolation, independent apps
+and overlapping reloads. Benchmark pool 6 with queue 0/16/32 and deadlines
+100/250/500 ms, balanced and deliberately uneven workers, warm/cold connections,
+short reads, slow queries and mixed writes. Record successful throughput,
+success-only p95/p99, queue wait, rejection/expiry counts, PostgreSQL CPU and
+peak memory; fast 503s must not improve the reported latency distribution.
+Use separate active/waiting counters: this PostgREST checkout's `PoolRequest`
+observations bracket the whole `SQL.use` call, so its named waiting gauge is
+not a direct model for an exact pgrest FIFO length. Keep observations bounded
+and server-local, without per-request telemetry calls.
+
+**Keep the solution small.** Prefer the bounded native queue only if request
+ownership, cancellation and subrequest completion remain explicit and testable.
+Prototype and run the lifecycle tests above locally before proposing beta
+enablement. Do not grow a separate scheduler, Redis queue or automatic write
+retry mechanism to absorb ordinary API bursts.
+
+PgBouncer is not a drop-in solution for this module. The current
+`pgrest_auth.build_combined_jwt_setup_query` emits session-scoped `RESET ROLE`,
+`SET request.jwt` and `SET ROLE`; `queue_jwt_setup_queries` schedules the API SQL
+as subsequent commands without an encompassing transaction. PgBouncer transaction
+pooling can change the server connection between those commands, breaking the
+identity contract. Its [pooling-mode reference](https://www.pgbouncer.org/features.html)
+documents this session-feature limitation. Session pooling preserves that
+contract but pins backend connections for pgrest's persistent client sessions,
+so it does not provide the desired per-request capacity sharing. Neither mode
+removes pgrest's earlier local-slot rejection. Transaction pooling would first
+require a complete transaction/SET LOCAL/error-cleanup design.
+
+If the native queue requires invasive lifecycle changes, evaluate PostgREST as
+the established alternative for public SQL APIs. That is a separate architecture
+decision: Carve and Duell currently require the direct native path, and SQL/JWT,
+RPC, response and error contracts need compatibility verification. In particular,
+this PostgREST checkout sets transaction-local `request.jwt.claims` JSON in
+`Query/PreQuery.hs`, whereas Carve SQL reads the raw token from `request.jwt`.
+Replacing the handler therefore requires deliberate adaptation, not just a
+proxy directive. Nginx delayed rate limiting is a simpler burst-smoothing option
+within the current architecture, but a request-rate bound cannot guarantee free
+database slots when query durations vary. Keep the deployed six-slot pools while
+measuring that tradeoff; none of these alternatives is enabled by this study.
+
+**Local coexistence evidence (2026-10-05).** Duell's opt-in
+`npm run backend:test:postgrest` now exercises PostgREST 16.4 alongside beta's
+nginz 1.30 image, using the existing PostgreSQL container and reusable named
+volumes. Its isolated database includes a private pre-request hook that sets
+transaction-local `request.jwt` from the authenticated Authorization header.
+The native JWT guard remains on the proxy branch. A selected-read/native-write
+split passed 293 checks, including 26 matching application read response pairs,
+JWT/schema isolation, queued requests across nginx reload and acquisition expiry.
+Twenty simultaneous 100 ms queries produced 12 successes and eight 503s with
+native pools of six per worker; PostgREST's four shared query connections served
+all 20 in 553 ms. These are local controlled waits, not beta throughput results.
+The test also records actual differences in SQL error bodies, URL decoding,
+numeric-looking text arguments and unknown argument names. See the sibling
+Duell backend README's "Local PostgREST coexistence pilot" section and
+`backend/test/postgrest-pilot.mjs`. This establishes a viable local experiment;
+neither beta routing nor this module's acquisition behavior was changed.

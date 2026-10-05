@@ -74,6 +74,11 @@ pub const pgErrorMessage = pq.PQerrorMessage;
 pub const pgResultErrorMessage = pq.PQresultErrorMessage;
 pub const pgResultErrorField = pq.PQresultErrorField;
 pub const PG_DIAG_SQLSTATE = pq.PG_DIAG_SQLSTATE;
+pub const PG_DIAG_MESSAGE_PRIMARY = pq.PG_DIAG_MESSAGE_PRIMARY;
+pub const PG_DIAG_MESSAGE_DETAIL = pq.PG_DIAG_MESSAGE_DETAIL;
+pub const PG_DIAG_MESSAGE_HINT = pq.PG_DIAG_MESSAGE_HINT;
+pub const pgTransactionStatus = pq.PQtransactionStatus;
+pub const PQTRANS_IDLE = pq.PQTRANS_IDLE;
 
 // Non-blocking connection functions
 pub const pgConnectStart = pq.PQconnectStart;

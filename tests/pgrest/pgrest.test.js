@@ -1,3 +1,4 @@
+import { createPostgresMock, dataSql } from './mock.js';
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
@@ -6,7 +7,6 @@ import {
   stopNginz,
   cleanupRuntime,
   TEST_URL,
-  createPostgresMock,
   MOCK_PORTS,
 } from "../harness.js";
 
@@ -15,7 +15,7 @@ let pgMock;
 let resetPgMock;
 
 function lastSql() {
-  return pgMock.getLastQuery();
+  return dataSql(pgMock.getQueryLog().filter(q => !/^(BEGIN|COMMIT|SELECT current_setting)/.test(q)).at(-1));
 }
 
 
@@ -71,7 +71,7 @@ describe("pgrest module", () => {
     }));
 
     pgMock.setQueryHandler(/^SELECT id,name,\(SELECT COALESCE\(json_agg\(pgrest_embed_row\), '\[\]'\) FROM \(SELECT id,amount FROM orders AS pgrest_rel_orders WHERE pgrest_rel_orders\.user_id = users\.id\) AS pgrest_embed_row\) AS orders FROM users ORDER BY id ASC$/, () => ({
-      columns: ["id", "name", "orders"],
+      columns: ["id", "name", {name:"orders",typeOid:114}],
       rows: [
         ["1", "John Doe", '[{"id":"10","amount":"42.50"},{"id":"11","amount":"84.00"}]'],
         ["2", "Jane Smith", '[]'],
@@ -79,17 +79,17 @@ describe("pgrest module", () => {
     }));
 
     pgMock.setQueryHandler(/^SELECT id,name,\(SELECT COALESCE\(json_agg\(pgrest_embed_row\), '\[\]'\) FROM \(SELECT id FROM orders AS pgrest_rel_orders WHERE pgrest_rel_orders\.user_id = users\.id\) AS pgrest_embed_row\) AS orders FROM users WHERE EXISTS \(SELECT 1 FROM orders AS pgrest_rel_orders WHERE pgrest_rel_orders\.user_id = users\.id\) ORDER BY id ASC$/, () => ({
-      columns: ["id", "name", "orders"],
+      columns: ["id", "name", {name:"orders",typeOid:114}],
       rows: [["1", "John Doe", '[{"id":"10"},{"id":"11"}]']],
     }));
 
     pgMock.setQueryHandler(/^SELECT id,amount,\(SELECT row_to_json\(pgrest_embed_row\) FROM \(SELECT id,name FROM users AS pgrest_rel_user WHERE pgrest_rel_user\.id = orders\.user_id\) AS pgrest_embed_row\) AS user FROM orders ORDER BY id ASC$/, () => ({
-      columns: ["id", "amount", "user"],
+      columns: ["id", "amount", {name:"user",typeOid:114}],
       rows: [["10", "42.50", '{"id":"1","name":"John Doe"}']],
     }));
 
     pgMock.setQueryHandler(/^SELECT id,\(SELECT COALESCE\(json_agg\(pgrest_embed_row\), '\[\]'\) FROM \(SELECT id,name,\(SELECT row_to_json\(pgrest_embed_row\) FROM \(SELECT id,name FROM users AS pgrest_rel_teams_owner WHERE pgrest_rel_teams_owner\.id = pgrest_rel_teams\.owner_id\) AS pgrest_embed_row\) AS owner FROM teams AS pgrest_rel_teams JOIN memberships AS pgrest_junction ON pgrest_rel_teams\.id = pgrest_junction\.team_id WHERE pgrest_junction\.user_id = users\.id\) AS pgrest_embed_row\) AS teams FROM users ORDER BY id ASC$/, () => ({
-      columns: ["id", "teams"],
+      columns: ["id", {name:"teams",typeOid:114}],
       rows: [["1", '[{"id":"7","name":"Platform","owner":{"id":"2","name":"Jane Smith"}}]']],
     }));
 
@@ -449,59 +449,59 @@ describe("pgrest module", () => {
       rows: [["9"]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'get_user_count'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "f", "f", "f", "0", "", "", "", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'get_user_count'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "f", "f", "f", "0", "", "", "", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'tenant_001' AND p\.proname = 'get_user_count'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "f", "f", "f", "0", "", "", "", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'tenant_001' AND p\.proname\s*=\s*'get_user_count'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "f", "f", "f", "0", "", "", "", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'add_them'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "f", "f", "f", "0", "", "", "a,b", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'add_them'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "f", "f", "f", "0", "", "", "a,b", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'process_numbers'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "t", "t", "f", "0", "", "", "ids", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'process_numbers'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "t", "t", "f", "0", "", "", "ids", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'create_user'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["v", "t", "t", "f", "0", "", "", "data", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'create_user'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["v", "t", "t", "f", "0", "", "", "data", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'get_profile'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "t", "t", "f", "0", "", "", "id", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'get_profile'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "t", "t", "f", "0", "", "", "id", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'import_csv'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["v", "f", "f", "f", "0", "", "", "data", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'import_csv'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["v", "f", "f", "f", "0", "", "", "data", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'upload_blob'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["v", "f", "f", "f", "1", "bytea", "", "", "1"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'upload_blob'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["v", "f", "f", "f", "1", "bytea", "", "", "1", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'mult_them'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "f", "f", "f", "1", "json", "", "", "1"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'mult_them'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "f", "f", "f", "1", "json", "", "", "1", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'plus_one'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["i", "f", "f", "t", "0", "", "v", "v", "0"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'plus_one'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["i", "f", "f", "t", "0", "", "v", "v", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
-    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname = 'public' AND p\.proname = 'best_films_2017'.*LIMIT 1/, () => ({
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["s", "t", "t", "f", "0", "", "", "", "2"]],
+    pgMock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*pn\.nspname\s*=\s*'public' AND p\.proname\s*=\s*'best_films_2017'/, () => ({
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["s", "t", "t", "f", "0", "", "", "", "0", '{"a":"integer","b":"integer","ids":"integer[]","id":"integer","data":"jsonb","v":"integer[]"}', "f", ""]],
     }));
 
     pgMock.setQueryHandler(/SELECT mult_them\('\{"x":4,"y":2\}'\)/, () => ({
@@ -509,7 +509,7 @@ describe("pgrest module", () => {
       rows: [["8"]],
     }));
 
-    pgMock.setQueryHandler(/SELECT plus_one\(VARIADIC v => ARRAY\[1,2,3,4\]\)/, () => ({
+    pgMock.setQueryHandler(/SELECT plus_one\(VARIADIC v =>/, () => ({
       columns: ["plus_one"],
       rows: [["{2,3,4,5}"]],
     }));
@@ -522,6 +522,10 @@ describe("pgrest module", () => {
       ],
     }));
 
+    pgMock.setQueryHandler(/^SELECT title,rating FROM "best_films_2017"\(\) WHERE rating > '8' ORDER BY title DESC$/, () => ({
+      columns: ["title", "rating"],
+      rows: [["The Worst Person in the World", "8.1"], ["Portrait of a Lady on Fire", "8.2"], ["Another Film", "8.3"]],
+    }));
     pgMock.setQueryHandler(/^SELECT count\(\*\) FROM "best_films_2017"\(\) WHERE rating > '8'$/, () => ({
       columns: ["count"],
       rows: [["3"]],
@@ -538,12 +542,12 @@ describe("pgrest module", () => {
       rows: [["3"]],
     }));
 
-    pgMock.setQueryHandler(/^SELECT \* FROM "get_profile"\(id => 1\)$/, () => ({
+    pgMock.setQueryHandler(/^SELECT \* FROM "get_profile"\(id => \(SELECT x.id FROM json_to_record/, () => ({
       columns: ["id", "name", "bio"],
       rows: [["1", "John Doe", null]],
     }));
 
-    pgMock.setQueryHandler(/^SELECT \* FROM "process_numbers"\(ids => ARRAY\[1,2,3\]\)$/, () => ({
+    pgMock.setQueryHandler(/^SELECT \* FROM "process_numbers"\(ids => \(SELECT x.ids FROM json_to_record/, () => ({
       columns: ["id", "squared"],
       rows: [
         ["1", "1"],
@@ -1062,7 +1066,7 @@ describe("pgrest module", () => {
   test("POST /api/users inserts new user and returns result", async () => {
     const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -1087,7 +1091,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: "name=Form+User&email=form%40example.com&status=active",
@@ -1190,7 +1194,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
         "Content-Profile": "tenant_001",
       },
@@ -1250,7 +1254,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
         "Content-Profile": "tenant_001",
       },
@@ -1270,7 +1274,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "DELETE",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Profile": "admin",
       },
     });
@@ -1286,7 +1290,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "DELETE",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Accept-Profile": "admin",
       },
     });
@@ -1300,7 +1304,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ status: "inactive", email: null, name: "Updated User" }),
@@ -1314,7 +1318,7 @@ describe("pgrest module", () => {
     );
   });
 
-  test("POST /api/users with Prefer: return=minimal omits body and RETURNING", async () => {
+  test("POST /api/users with Prefer: return=minimal omits body while retaining affected rows for validation", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
@@ -1330,7 +1334,7 @@ describe("pgrest module", () => {
     expect(res.headers.get("preference-applied")).toContain("return=minimal");
     expect(await res.text()).toBe("");
     expect(lastSql()).toBe(
-      "INSERT INTO users (name,email,status) VALUES ('New User','new@example.com','active')"
+      "INSERT INTO users (name,email,status) VALUES ('New User','new@example.com','active') RETURNING *"
     );
   });
 
@@ -1339,7 +1343,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
       },
       body: JSON.stringify([
@@ -1361,7 +1365,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "text/csv",
       },
       body: "name,email,status\nCsv A,csv-a@example.com,active\nCsv B,csv-b@example.com,inactive\n",
@@ -1471,7 +1475,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.4`, {
       method: "PUT",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ id: 4, name: "Sara B.", email: "sara@example.com", status: "active" }),
@@ -1488,7 +1492,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/api/users?limit=10&order=id&last_login=lt.2020-01-01`, {
       method: "PATCH",
-      headers: {
+      headers: { Prefer: "return=representation",
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ status: "inactive" }),
@@ -1504,7 +1508,7 @@ describe("pgrest module", () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/api/users?limit=10&order=id&status=eq.inactive`, {
-      method: "DELETE",
+      method: "DELETE", headers:{Prefer:"return=representation"},
     });
 
     expect(res.status).toBe(200);
@@ -1513,7 +1517,7 @@ describe("pgrest module", () => {
     );
   });
 
-  test("PATCH /api/users with Prefer: return=headers-only omits body and RETURNING", async () => {
+  test("PATCH /api/users with Prefer: return=headers-only omits body while retaining affected rows for validation", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
@@ -1525,10 +1529,10 @@ describe("pgrest module", () => {
       body: JSON.stringify({ status: "inactive" }),
     });
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(204);
     expect(res.headers.get("preference-applied")).toContain("return=headers-only");
     expect(await res.text()).toBe("");
-    expect(lastSql()).toBe("UPDATE users SET status='inactive' WHERE id = '5'");
+    expect(lastSql()).toBe("UPDATE users SET status='inactive' WHERE id = '5' RETURNING *");
   });
 
   test("POST /api/users with Prefer: handling=strict rejects invalid preferences before SQL", async () => {
@@ -1573,7 +1577,7 @@ describe("pgrest module", () => {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
-        Prefer: "max-affected=1",
+        Prefer: "handling=strict,max-affected=1,return=representation",
       },
       body: JSON.stringify({ status: "inactive" }),
     });
@@ -1589,13 +1593,13 @@ describe("pgrest module", () => {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
-        Prefer: "max-affected=1",
+        Prefer: "handling=strict,max-affected=1,return=representation",
       },
       body: JSON.stringify({ status: "inactive" }),
     });
 
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ message: "Query exceeds Prefer: max-affected" });
+    expect(await res.json()).toMatchObject({ code: "PGRST124" });
     expect(lastSql()).toBe(
       "UPDATE users SET status='inactive' WHERE status = 'active' RETURNING *"
     );
@@ -1630,7 +1634,7 @@ describe("pgrest module", () => {
     expect(body).toContain("3");
   });
 
-  test("POST /rpc/process_numbers converts JSON arrays to PostgreSQL ARRAY syntax", async () => {
+  test("POST /rpc/process_numbers decodes JSON arrays using the catalog PostgreSQL type", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/rpc/process_numbers`, {
@@ -1644,7 +1648,8 @@ describe("pgrest module", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toHaveLength(3);
-    expect(lastSql()).toBe(`SELECT * FROM "process_numbers"(ids => ARRAY[1,2,3])`);
+    expect(lastSql()).toContain("json_to_record(");
+    expect(lastSql()).toContain("AS x(ids integer[])");
   });
 
   test("POST /rpc/create_user with Prefer: params=single-object wraps the body into a data parameter", async () => {
@@ -1681,7 +1686,7 @@ describe("pgrest module", () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain("3");
-    expect(lastSql()).toBe("SELECT add_them(a => 1, b => 2)");
+    expect(lastSql()).toBe("SELECT add_them(a => '1', b => '2')");
   });
 
   test("POST /rpc/add_them rejects raw text for named numeric arguments", async () => {
@@ -1769,7 +1774,7 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/rpc/plus_one?v=1&v=2&v=3&v=4`);
     expect(res.status).toBe(200);
-    expect(lastSql()).toBe("SELECT plus_one(VARIADIC v => ARRAY[1,2,3,4])");
+    expect(lastSql()).toBe(`SELECT plus_one(VARIADIC v => '{"1","2","3","4"}')`);
     expect(await res.text()).toContain("{2,3,4,5}");
   });
 
@@ -1778,14 +1783,14 @@ describe("pgrest module", () => {
 
     const res = await fetchClose(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`);
     expect(res.status).toBe(200);
-    expect(lastSql()).toBe(`SELECT title,rating FROM "best_films_2017"() WHERE rating > '8' ORDER BY title DESC LIMIT 2`);
+    expect(lastSql()).toContain(`SELECT title,rating FROM "best_films_2017"() WHERE rating > '8' ORDER BY title DESC`);
     expect(await res.json()).toEqual([
       { title: "The Worst Person in the World", rating: "8.1" },
       { title: "Portrait of a Lady on Fire", rating: "8.2" },
     ]);
   });
 
-  test("GET /users honors Range headers in blocking mode", async () => {
+  test("GET /users honors Range headers", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/api/users`, {
@@ -1804,7 +1809,7 @@ describe("pgrest module", () => {
     ]);
   });
 
-  test("GET /users with Prefer: count=exact returns partial-content metadata in blocking mode", async () => {
+  test("GET /users with Prefer: count=exact returns partial-content metadata", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
@@ -1817,10 +1822,11 @@ describe("pgrest module", () => {
     expect(res.headers.get("range-unit")).toBe("items");
     expect(res.headers.get("content-range")).toBe("0-1/3");
     expect(res.headers.get("preference-applied")).toContain("count=exact");
-    expect(lastSql()).toBe("SELECT * FROM users LIMIT 2");
+    expect(lastSql()).toContain("WITH pgrst_source AS MATERIALIZED (SELECT * FROM users)");
+    expect(lastSql()).toContain("TABLE pgrst_source LIMIT 2 OFFSET 0");
   });
 
-  test("GET /rpc/best_films_2017 with Prefer: count=exact returns TVF count metadata in blocking mode", async () => {
+  test("GET /rpc/best_films_2017 with Prefer: count=exact returns TVF count metadata", async () => {
     pgMock.clearTracking();
 
     const res = await fetchClose(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`, {
@@ -1832,7 +1838,9 @@ describe("pgrest module", () => {
     expect(res.status).toBe(206);
     expect(res.headers.get("content-range")).toBe("0-1/3");
     expect(res.headers.get("preference-applied")).toContain("count=exact");
-    expect(lastSql()).toBe(`SELECT title,rating FROM "best_films_2017"() WHERE rating > '8' ORDER BY title DESC LIMIT 2`);
+    expect(lastSql()).toContain("WITH pgrst_source AS MATERIALIZED");
+    expect(lastSql()).toContain("TABLE pgrst_source LIMIT 2 OFFSET 0");
+    expect(lastSql()).toContain(`SELECT title,rating FROM "best_films_2017"() WHERE rating > '8' ORDER BY title DESC`);
   });
 
   test("GET /users with Prefer: count=planned uses EXPLAIN instead of count(*)", async () => {
@@ -1881,25 +1889,16 @@ describe("pgrest module", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(lastSql()).toBe("SELECT plus_one(VARIADIC v => ARRAY[1,2,3,4])");
+    expect(lastSql()).toBe(`SELECT plus_one(VARIADIC v => '{"1","2","3","4"}')`);
     expect(await res.text()).toContain("{2,3,4,5}");
   });
 
-  test("GET /rpc/create_user rejects GET when function metadata is volatile", async () => {
+  test("GET volatile RPC executes inside a read-only transaction", async () => {
     pgMock.clearTracking();
-
-    const res = await fetchClose(`${TEST_URL}/rpc/create_user`);
-    expect(res.status).toBe(405);
-    expect(res.headers.get("allow")).toBe("OPTIONS,POST");
-    expect(await res.json()).toEqual({
-      message: "The HTTP method is not allowed for this RPC function",
-    });
-    expect(lastSql()).not.toContain("SELECT create_user(");
+    const res = await fetchClose(TEST_URL + "/rpc/create_user");
+    expect(res.status).toBe(200);
+    expect(pgMock.getQueryLog().some(q=>q.startsWith("BEGIN READ ONLY"))).toBe(true);
   });
-
-  // ============================================================================
-  // Content Negotiation (Accept Header) Tests
-  // ============================================================================
 
   test("GET /api/users with Accept: text/csv returns CSV format", async () => {
     const res = await fetchClose(`${TEST_URL}/api/users`, {
@@ -2033,7 +2032,7 @@ describe("pgrest module", () => {
     expect(res.status).toBe(406);
 
     const body = await res.json();
-    expect(body.message).toContain("JSON object requested");
+    expect(body.code).toBe("PGRST116");
   });
 
   test("GET /api/profiles with pgrst object accept returns 406 when multiple rows are returned", async () => {
@@ -2043,7 +2042,7 @@ describe("pgrest module", () => {
     expect(res.status).toBe(406);
 
     const body = await res.json();
-    expect(body.message).toContain("JSON object requested");
+    expect(body.code).toBe("PGRST116");
   });
 
   test("GET /api/profiles with nulls=stripped removes null fields from array results", async () => {
@@ -2337,7 +2336,7 @@ describe("pgrest module", () => {
       expect(pgMock.getLastSetJwt()).toBe(jwt);
     });
 
-    test("every request starts with RESET ROLE to prevent cross-request role leakage", async () => {
+    test("every request starts a transaction with local identity to prevent leakage", async () => {
       pgMock.clearTracking();
 
       const res = await fetchClose(`${TEST_URL}/jwt-api/users`);
@@ -2348,8 +2347,9 @@ describe("pgrest module", () => {
       // The combined setup query packs RESET ROLE, SET request.jwt, and SET
       // ROLE into a single multi-statement query to reduce round-trips.
       const log = pgMock.getQueryLog();
-      expect(log[0]).toStartWith("RESET ROLE");
-      expect(pgMock.getResetRoleCount()).toBeGreaterThanOrEqual(1);
+      expect(log[0]).toStartWith("BEGIN ");
+      expect(log[0]).toContain("SET LOCAL ROLE");
+      expect(pgMock.getQueryLog().some(q=>q.includes("SET LOCAL ROLE"))).toBe(true);
     });
 
     test("request without JWT clears request.jwt session variable", async () => {
@@ -2382,7 +2382,7 @@ describe("pgrest module", () => {
       expect(res2.status).toBe(200);
 
       // RESET ROLE must have fired, clearing the previous role.
-      expect(pgMock.getResetRoleCount()).toBeGreaterThanOrEqual(1);
+      expect(pgMock.getQueryLog().some(q=>q.includes("SET LOCAL ROLE"))).toBe(true);
       // Then anon_role was re-applied for this request.
       expect(pgMock.getLastSetRole()).toBe("anon");
     });
@@ -2422,7 +2422,7 @@ describe("pgrest module", () => {
 
     test("parameter overflow returns 400 instead of sending mixed placeholder SQL", async () => {
       pgMock.clearTracking();
-      const values = Array.from({ length: 65 }, (_, i) => `v${i}`).join(",");
+      const values = Array.from({ length: 257 }, () => "v").join(",");
       const res = await fetchClose(`${TEST_URL}/api/users?name=in.(${values})`);
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ message: "Too many SQL parameters" });

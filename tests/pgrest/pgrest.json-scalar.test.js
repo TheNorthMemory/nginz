@@ -1,9 +1,9 @@
+import { createPostgresMock } from './mock.js';
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   startNginz,
-  createPostgresMock,
   MOCK_PORTS,
   prepareMockPorts,
   teardownModule,
@@ -28,19 +28,24 @@ function scalarResult(name, value, typeOid = 3802) {
 
 function setupPgMock() {
   const mock = createPostgresMock(MOCK_PORTS.POSTGRES);
-  mock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*p\.proname = '(scalar_[^']+)'/, (query) => {
-    const name = query.match(/p\.proname = '(scalar_[^']+)'/)[1];
+  mock.setQueryHandler(/SELECT p\.provolatile, p\.proretset.*p\.proname\s*=\s*'(scalar_[^']+)'/, (query) => {
+    const name = query.match(/p\.proname\s*=\s*'(scalar_[^']+)'/)[1];
     return {
-      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank"],
-      rows: [["s", "f", "f", "f", "0", "", "", name.endsWith("_sized") ? "bytes" : "", "0"]],
+      columns: ["provolatile", "proretset", "rettype_is_composite", "has_variadic", "unnamed_count", "single_unnamed_kind", "variadic_param_name", "input_param_names", "match_rank", "input_types", "returns_void", "signature"],
+      rows: [["s", /_(no_rows|two_rows)$/.test(name) ? "t" : "f", name.endsWith("_two_columns") ? "t" : "f", "f", "0", "", "", name.endsWith("_sized") ? "bytes" : "", "0", '{"bytes":"integer"}', "f", ""]],
     };
   });
-  mock.setQueryHandler(/^SELECT (scalar_\w+)\(bytes => (\d+)\)$/, (query) => {
-    const [, name, bytes] = query.match(/^SELECT (scalar_\w+)\(bytes => (\d+)\)$/);
+  mock.setQueryHandler(/^SELECT (scalar_\w+)\(bytes => '?(\d+)'?\)$/, (query) => {
+    const [, name, bytes] = query.match(/^SELECT (scalar_\w+)\(bytes => '?(\d+)'?\)$/);
     return scalarResult(name, sizedJson(Number(bytes)), name.endsWith("_json_sized") ? 114 : 3802);
   });
-  mock.setQueryHandler(/^SELECT (scalar_\w+)\(\)$/, (query) => {
-    const name = query.match(/^SELECT (scalar_\w+)\(\)$/)[1];
+  mock.setQueryHandler(/^SELECT (scalar_\w+)\(bytes => \(SELECT x.bytes FROM json_to_record\('/, query => {
+    const name = query.match(/^SELECT (scalar_\w+)/)[1];
+    const payload = JSON.parse(query.match(/json_to_record\('([^']+)'::json\)/)[1]);
+    return scalarResult(name, sizedJson(payload.bytes));
+  });
+  mock.setQueryHandler(/^SELECT (?:\* FROM )?"?(scalar_\w+)"?\(\)$/, (query) => {
+    const name = query.match(/^SELECT (?:\* FROM )?"?(scalar_\w+)"?\(\)$/)[1];
     if (name.endsWith("_sql_null")) return scalarResult(name, null);
     if (name.endsWith("_json_null")) return scalarResult(name, "null");
     if (name.endsWith("_array")) return scalarResult(name, '[0,true,null,{"nested":[1,2]}]');
@@ -160,21 +165,23 @@ describe("pgrest scalar JSON response limits", () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual([{ [name]: VALUE }]);
     });
-    test(`${prefix} retains the table response limit`, async () => {
-      await expectLimitError(`/rpc/${prefix}_sized?bytes=600000`);
+    test(`${prefix} applies the configured bound to wrapped responses`, async () => {
+      const response = await testFetch(`/rpc/${prefix}_sized?bytes=600000`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual([{[`${prefix}_sized`]:JSON.parse(sizedJson(600000))}]);
     });
   }
 
-  test("non-JSON PostgreSQL types are still wrapped and escaped", async () => {
+  test("PostgreSQL text scalars are unwrapped and escaped", async () => {
     const name = "scalar_large_text";
     const response = await testFetch(`/rpc/${name}`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual([{ [name]: JSON_TEXT }]);
+    expect(await response.json()).toEqual(JSON_TEXT);
   });
 
   for (const [suffix, expected] of [
     ["no_rows", []],
-    ["two_rows", [{ scalar_large_two_rows: VALUE }, { scalar_large_two_rows: null }]],
+    ["two_rows", [VALUE, null]],
     ["two_columns", [{ value: VALUE, label: "kept" }]],
   ]) {
     test(`${suffix} keeps the ordinary result shape`, async () => {

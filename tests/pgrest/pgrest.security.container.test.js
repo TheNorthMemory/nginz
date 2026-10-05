@@ -139,24 +139,26 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   for (const value of [1, true, null, "bound", ["array"], { nested: "JSON" }]) {
     test("JSON argument-name injection is rejected for " + JSON.stringify(value), async () => {
       const response = await post("/carve/profile", { ["ptext => current_user) --"]: value });
-      expect(response.status).toBe(400); expect(await response.json()).toEqual({ code: "invalid_rpc_parameters" });
+      expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" });
       expectUnchanged();
     });
   }
 
   test("table-returning RPCs also reject argument-name injection", async () => {
     const response = await post("/rpc/echo_table", { ["ptext => current_user) --"]: 1 });
-    expect(response.status).toBe(400); expectUnchanged();
+    expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" }); expectUnchanged();
   });
 
-  test("unknown and duplicate named arguments fail closed", async () => {
-    expect((await post("/rpc/echo", { unknown: 1 })).status).toBe(400);
-    expect((await post("/rpc/echo", "ptext=one&ptext=two", FORM_TYPE)).status).toBe(400);
+  test("unknown names reject and duplicate named arguments use the last value", async () => {
+    expect((await post("/rpc/echo", { unknown: 1 })).status).toBe(404);
+    const duplicate = await post("/rpc/echo", "ptext=one&ptext=two", FORM_TYPE);
+    expect(duplicate.status).toBe(200); expect(await duplicate.json()).toBe("two");
+    expectUnchanged();
   });
 
   test("an injected expression cannot change the database JWT context", async () => {
     const response = await post("/carve/profile", { ["ptext => set_config('request.jwt','forged',false)) --"]: 1 });
-    expect(response.status).toBe(400); expectUnchanged();
+    expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" }); expectUnchanged();
   });
 
   test("a whole JSON body preserves SQL-looking keys as data", async () => {
@@ -168,7 +170,7 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   test("form input cannot bypass an unnamed JSON RPC", async () => {
     const form = new URLSearchParams({ ["jsonb_build_object('injected',current_user)) --"]: "1" }).toString();
     const response = await post("/duell/profile", form, FORM_TYPE);
-    expect(response.status).toBe(415); expectUnchanged();
+    expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" }); expectUnchanged();
   });
 
   test("whole JSON RPCs preserve arrays of objects used by app commands", async () => {
@@ -189,9 +191,12 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
     expect(response.status).toBe(200); expect(await response.json()).toBe(value);
   });
 
-  test("malformed and excessive form arguments fail closed", async () => {
-    expect((await post("/rpc/echo", "ptext=%ZZ", FORM_TYPE)).status).toBe(400);
-    expect((await post("/rpc/echo", Array.from({ length: 17 }, () => "ptext=value").join("&"), FORM_TYPE)).status).toBe(400);
+  test("malformed escapes remain literal and repeated ordinary names use the last value", async () => {
+    const malformed = await post("/rpc/echo", "ptext=%ZZ", FORM_TYPE);
+    expect(malformed.status).toBe(200); expect(await malformed.json()).toBe("%ZZ");
+    const repeated = await post("/rpc/echo", Array.from({ length: 17 }, () => "ptext=value").join("&"), FORM_TYPE);
+    expect(repeated.status).toBe(200); expect(await repeated.json()).toBe("value");
+    expectUnchanged();
   });
 
   test("generated arrays escape quotes and backslashes with non-standard SQL strings", async () => {
@@ -218,9 +223,10 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
     expect(response.status).toBe(200); expect(await response.json()).toEqual(value);
   });
 
-  test("an overflowing first parameter cannot fall back to inline SQL", async () => {
-    const response = await post("/duell/profile", { value: "x".repeat(9000) }, JSON_TYPE, token(), { Prefer: "params=single-object" });
-    expect(response.status).toBe(400); expectUnchanged();
+  test("a large first parameter remains bound and cannot contribute SQL", async () => {
+    const value = { value: "x".repeat(9000) + "'); UPDATE audit.items SET value='injected'; --" };
+    const response = await post("/duell/profile", value);
+    expect(response.status).toBe(200); expect(await response.json()).toEqual(value); expectUnchanged();
   });
 
   test("table names cannot contribute SQL expressions", async () => {

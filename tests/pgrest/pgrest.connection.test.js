@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { cleanupRuntime, startNginz, stopNginz, TEST_URL, createPostgresMock } from "../harness.js";
+import { cleanupRuntime, startNginz, stopNginz, TEST_URL } from "../harness.js";
+import { createPostgresMock } from "./mock.js";
 
 const MODULE = "pgrest";
 
