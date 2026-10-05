@@ -10,7 +10,7 @@ import { startNginz, stopNginz, cleanupRuntime, TEST_URL, stableFetch } from "..
 const MODULE = "pgrest-security";
 const PG = "pgrest-nginz-test";
 const RUN = "pgrest_security_" + randomBytes(6).toString("hex");
-const AUTH = RUN + "_authenticator", USER = RUN + "_weapp", ANON = RUN + "_anon";
+const AUTH = RUN + "_authenticator", USER = RUN + "_api", ANON = RUN + "_anon";
 const SECRET = randomBytes(32).toString("hex"), PASSWORD = randomBytes(32).toString("hex");
 const JSON_TYPE = "application/json", FORM_TYPE = "application/x-www-form-urlencoded";
 const run = (command, options) => spawnSync(command[0], command.slice(1), options);
@@ -27,7 +27,7 @@ function token(overrides = {}, secret = SECRET, header = { alg: "HS256", typ: "J
   const now = Math.floor(Date.now() / 1000);
   const encode = value => Buffer.from(JSON.stringify(value)).toString("base64url");
   const unsigned = encode(header) + "." + encode({
-    iss: RUN, aud: "duell-api", sub: "duell", role: USER, appid: "wx1234567890abcdef", app: RUN,
+    iss: RUN, aud: "fixture-api", sub: "fixture", role: USER, appid: "fixture-client", app: RUN,
     oid: "audit-owner", exp: now + 300, nbf: now - 5, ...overrides,
   });
   return unsigned + "." + createHmac("sha256", secret).update(unsigned).digest("base64url");
@@ -73,8 +73,8 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
       GRANT SELECT,INSERT,UPDATE,DELETE ON audit.items TO ${USER};
       ALTER ROLE ${AUTH} SET standard_conforming_strings=off;`);
     directory = mkdtempSync(join(tmpdir(), "nginz-pgrest-security-"));
-    const jwt = `jwt_secret "${SECRET}"; jwt_issuer ${RUN}; jwt_audience duell-api;
-      jwt_require_claim sub eq duell; jwt_require_claim role eq ${USER}; jwt_require_claim appid eq wx1234567890abcdef;
+    const jwt = `jwt_secret "${SECRET}"; jwt_issuer ${RUN}; jwt_audience fixture-api;
+      jwt_require_claim sub eq fixture; jwt_require_claim role eq ${USER}; jwt_require_claim appid eq fixture-client;
       jwt_require_claim app eq ${RUN}; jwt_require_claim oid !eq ""; jwt_require_claim exp gt 0;
       jwt_validate_exp on; jwt_validate_sig on;`;
     const pg = `pgrest_pass "host=127.0.0.1 port=5432 dbname=${RUN} user=${AUTH} password=${PASSWORD} connect_timeout=3";
@@ -84,8 +84,8 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
       events { worker_connections 64; } http { access_log off; client_max_body_size 16k; client_body_buffer_size 16k;
         variables_hash_max_size 2048; variables_hash_bucket_size 128;
         server { listen 8888; jwt_secret off;
-          location = /duell/profile { limit_except POST { deny all; } ${jwt} rewrite ^ /rpc/whole break; ${pg} }
-          location = /carve/profile { limit_except POST { deny all; } ${jwt} rewrite ^ /rpc/echo break; ${pg} }
+          location = /fixed/json { limit_except POST { deny all; } ${jwt} rewrite ^ /rpc/whole break; ${pg} }
+          location = /fixed/echo { limit_except POST { deny all; } ${jwt} rewrite ^ /rpc/echo break; ${pg} }
           location /rpc/ { ${jwt} ${pg} } location /api/ { ${jwt} ${pg} }
           location / { return 404; }
         } }`, { mode: 0o600 });
@@ -107,14 +107,14 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   for (const [label, jwt] of [
     ["missing JWT", null], ["wrong signing key", token({}, "incorrect-key")],
     ["wrong issuer", token({ iss: "other-app" })], ["wrong audience", token({ aud: "other-api" })],
-    ["wrong app", token({ app: "other-app" })], ["wrong AppID", token({ appid: "wx2222222222222222" })],
+    ["wrong app", token({ app: "other-app" })], ["wrong AppID", token({ appid: "other-client" })],
     ["wrong subject", token({ sub: "other-product" })], ["wrong role", token({ role: AUTH })],
     ["missing owner", token({ oid: "" })], ["expired JWT", token({ exp: Math.floor(Date.now() / 1000) - 60 })],
     ["future JWT", token({ nbf: Math.floor(Date.now() / 1000) + 3600 })],
     ["unsigned algorithm", token({}, SECRET, { alg: "none" })],
   ]) {
     test(label + " cannot reach the fixed RPC", async () => {
-      const response = await post("/duell/profile", { nickname: "safe" }, JSON_TYPE, jwt);
+      const response = await post("/fixed/json", { nickname: "safe" }, JSON_TYPE, jwt);
       expect(response.status).toBe(401); expectUnchanged();
     });
   }
@@ -132,13 +132,13 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
 
   test("SQL text in a bound string is returned literally", async () => {
     const value = "\\'; SELECT current_user; --";
-    const response = await post("/carve/profile", { ptext: value });
+    const response = await post("/fixed/echo", { ptext: value });
     expect(response.status).toBe(200); expect(await response.json()).toBe(value);
   });
 
   for (const value of [1, true, null, "bound", ["array"], { nested: "JSON" }]) {
     test("JSON argument-name injection is rejected for " + JSON.stringify(value), async () => {
-      const response = await post("/carve/profile", { ["ptext => current_user) --"]: value });
+      const response = await post("/fixed/echo", { ["ptext => current_user) --"]: value });
       expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" });
       expectUnchanged();
     });
@@ -157,31 +157,31 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   });
 
   test("an injected expression cannot change the database JWT context", async () => {
-    const response = await post("/carve/profile", { ["ptext => set_config('request.jwt','forged',false)) --"]: 1 });
+    const response = await post("/fixed/echo", { ["ptext => set_config('request.jwt','forged',false)) --"]: 1 });
     expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" }); expectUnchanged();
   });
 
   test("a whole JSON body preserves SQL-looking keys as data", async () => {
     const value = { ["jsonb_build_object('injected',current_user)) --"]: 1 };
-    const response = await post("/duell/profile", value);
+    const response = await post("/fixed/json", value);
     expect(response.status).toBe(200); expect(await response.json()).toEqual(value);
   });
 
   test("form input cannot bypass an unnamed JSON RPC", async () => {
     const form = new URLSearchParams({ ["jsonb_build_object('injected',current_user)) --"]: "1" }).toString();
-    const response = await post("/duell/profile", form, FORM_TYPE);
+    const response = await post("/fixed/json", form, FORM_TYPE);
     expect(response.status).toBe(404); expect(await response.json()).toMatchObject({ code: "PGRST202" }); expectUnchanged();
   });
 
   test("whole JSON RPCs preserve arrays of objects used by app commands", async () => {
     const value = { teams: [{ name: "Lions" }, { name: "Tigers" }], nested: { actions: [{ points: 2 }] } };
-    const response = await post("/duell/profile", value);
+    const response = await post("/fixed/json", value);
     expect(response.status).toBe(200); expect(await response.json()).toEqual(value);
   });
 
   test("whole JSON RPCs use binding instead of the named argument parser's 4 KB limit", async () => {
     const value = { payload: "x".repeat(5000) };
-    const response = await post("/duell/profile", value);
+    const response = await post("/fixed/json", value);
     expect(response.status).toBe(200); expect(await response.json()).toEqual(value);
   });
 
@@ -225,7 +225,7 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
 
   test("a large first parameter remains bound and cannot contribute SQL", async () => {
     const value = { value: "x".repeat(9000) + "'); UPDATE audit.items SET value='injected'; --" };
-    const response = await post("/duell/profile", value);
+    const response = await post("/fixed/json", value);
     expect(response.status).toBe(200); expect(await response.json()).toEqual(value); expectUnchanged();
   });
 
@@ -255,9 +255,9 @@ describe("pgrest SQL construction with real PostgreSQL and native JWT", () => {
   });
 
   test("valid named and unnamed calls still work after rejected requests", async () => {
-    const named = await post("/carve/profile", { ptext: "safe" });
+    const named = await post("/fixed/echo", { ptext: "safe" });
     expect(named.status).toBe(200); expect(await named.json()).toBe("safe");
-    const unnamed = await post("/duell/profile", { nickname: "safe" });
+    const unnamed = await post("/fixed/json", { nickname: "safe" });
     expect(unnamed.status).toBe(200); expect(await unnamed.json()).toEqual({ nickname: "safe" });
     expectUnchanged();
   });

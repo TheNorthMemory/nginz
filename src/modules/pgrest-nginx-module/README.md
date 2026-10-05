@@ -1373,15 +1373,13 @@ MALLOC_PERTURB_=165 GLIBC_TUNABLES=glibc.malloc.tcache_count=0 ZIG_OPTIMIZE=Rele
 ```
 
 For an inspectable binary, `zig build -Doptimize=ReleaseSmall -Dstrip=false`
-retains symbols. The default strip behavior is unchanged. Local real-database
-and remote stress results are recorded in the adjacent Carve repository's
-`docs/pgrest-stress.md`.
+retains symbols. The default strip behavior is unchanged. The module-owned
+real-database and queue regressions run through `bun test tests/pgrest`.
 
 Asynchronous failure and timeout completion drains nginx posted requests just
 as the success path does. This prevents a failed SQL subrequest from leaving
-an njs parent asleep until the client disconnects. The Carve regression denies
-the audit-chunk function grant, checks that provider dispatch stops and HTTP
-fails promptly, then forces a SQL timeout and checks readiness recovery.
+an njs parent asleep until the client disconnects. The module tests cover
+subrequest serialization failures, queued parent cancellation and recovery.
 
 RPC signature selection uses names, required/default arguments and ambiguity.
 JSON arguments are decoded by PostgreSQL's catalog types using the original
@@ -1425,6 +1423,48 @@ transport regressions force partial writes, zero writes, and closed sockets:
 ```sh
 ZIG_OPTIMIZE=ReleaseSmall bun test tests/mocks/postgres.test.js
 ```
+
+### Real-container acquisition queue regression
+
+From the nginz repository:
+
+```sh
+bun test tests/pgrest
+```
+
+The nine queue scenarios in `tests/pgrest/pgrest.queue.container.test.js` run as
+normal Bun tests, including the 60-second saturation test. The preload builds
+the local nginz binary. The suite uses the existing `pgrest-nginz-test`
+PostgreSQL container and its named data volume, plus an isolated native nginz
+process on an ephemeral port. It requires no application checkout, container,
+configuration or saved settings. Only its own temporary database/role and nginz
+process are cleaned up; existing services and volumes remain available.
+
+Private evidence lives under `$XDG_STATE_HOME/nginz/tests/pgrest-queue/<run>/`
+(default `~/.local/state/nginz/tests/pgrest-queue/<run>/`). See
+[the test README](../../../tests/pgrest/README.md) for prerequisites.
+
+A one-worker, one-slot pool and a separately controlled PostgreSQL advisory lock
+prove saturation before each edge case. Debug queue events confirm actual
+admission; a database ledger establishes execution order and exactly-once
+effects. Coverage includes queue cap/disabled/zero-timeout rejection, FIFO
+across locations, newcomers while a backlog drains, queued read/write and njs
+parent cancellation, HTTP/2 stream reset, active transaction cancellation,
+slot-release/deadline races, backend termination/reconnection, and graceful
+reload with six confirmed waiters. HTTP requests are never retried.
+
+The final phase warms the worker, disables debug logging, and runs at least
+60 seconds with 24 concurrent callers and one database slot. It records latency
+percentiles, worker identity, RSS, file descriptors and PostgreSQL connections.
+Assertions bound RSS growth to 16 MiB after warm-up, descriptors to baseline +2,
+connections to one and p99 to 2 seconds. Set `PGREST_QUEUE_SOAK_SECONDS=300`
+for a longer run. This catches gross leaks/stalls; it is not a production
+capacity benchmark or proof of long-duration leak freedom.
+
+Cancellation uses nginx's protocol-aware client-abort detector and HTTP request
+cleanup. Cleanup unlinks queue timers/posted events before request memory is
+freed and closes an active libpq connection to roll back unfinished work.
+A disconnect after SQL has committed still cannot establish non-commit.
 
 ### Runtime diagnostics
 
@@ -1504,7 +1544,7 @@ This section documents the Batch 12 hardening fixes that are now in place.
 
 ## Performance Study Notes
 
-This section records a code-reading performance study of the current pgrest implementation and a design comparison against the local PostgREST checkout at `/home/kaiwu/Documents/github/postgrest`. This is not yet a benchmark report. The goal is to identify the likely hot path, the most credible bottlenecks, and the optimization order that has the best chance of improving common general-query scenarios.
+This section records a code-reading performance study of the current pgrest implementation and a design comparison against the PostgREST source. This is not yet a benchmark report. The goal is to identify the likely hot path, the most credible bottlenecks, and the optimization order that has the best chance of improving common general-query scenarios.
 
 ### Scope and workload assumption
 
@@ -1690,11 +1730,9 @@ The candidate now implements bounded waiting; use the directives above and
 [the current audit](COMPATIBILITY.md). The proposal and timings below describe
 the original beta binary and are retained as historical comparison.
 
-Reviewed nginz `5a3d854` and the local PostgREST checkout at
-`/home/kaiwu/Documents/github/postgrest`, revision `d42ae9d5`. This study does not
-add directives or change module behavior. Carve and Duell beta currently opt into
-six public database connections per worker, with two nginx workers shared by
-both apps. Each app therefore has 12 public slots, distributed between workers.
+Reviewed nginz `5a3d854` and PostgREST revision `d42ae9d5`. This historical
+study predates the queue implementation. A pool of six connections per worker
+with two workers provides twelve slots, distributed between workers.
 
 **How PostgREST waits.** `PostgREST/AppState.hs` creates one pool in application
 state; request threads in that process share it. `PostgREST/AppState/Pool.hs`
@@ -1800,29 +1838,16 @@ require a complete transaction/SET LOCAL/error-cleanup design.
 
 If the native queue requires invasive lifecycle changes, evaluate PostgREST as
 the established alternative for public SQL APIs. That is a separate architecture
-decision: Carve and Duell currently require the direct native path, and SQL/JWT,
+decision: existing applications may require the direct native path, and SQL/JWT,
 RPC, response and error contracts need compatibility verification. In particular,
 this PostgREST checkout sets transaction-local `request.jwt.claims` JSON in
-`Query/PreQuery.hs`, whereas Carve SQL reads the raw token from `request.jwt`.
+`Query/PreQuery.hs`, whereas SQL written for this module may read the raw token from `request.jwt`.
 Replacing the handler therefore requires deliberate adaptation, not just a
 proxy directive. Nginx delayed rate limiting is a simpler burst-smoothing option
 within the current architecture, but a request-rate bound cannot guarantee free
 database slots when query durations vary. Keep the deployed six-slot pools while
 measuring that tradeoff; none of these alternatives is enabled by this study.
 
-**Local coexistence evidence (2026-10-05).** Duell's opt-in
-`npm run backend:test:postgrest` now exercises PostgREST 16.4 alongside beta's
-nginz 1.30 image, using the existing PostgreSQL container and reusable named
-volumes. Its isolated database includes a private pre-request hook that sets
-transaction-local `request.jwt` from the authenticated Authorization header.
-The native JWT guard remains on the proxy branch. A selected-read/native-write
-split passed 293 checks, including 26 matching application read response pairs,
-JWT/schema isolation, queued requests across nginx reload and acquisition expiry.
-Twenty simultaneous 100 ms queries produced 12 successes and eight 503s with
-native pools of six per worker; PostgREST's four shared query connections served
-all 20 in 553 ms. These are local controlled waits, not beta throughput results.
-The test also records actual differences in SQL error bodies, URL decoding,
-numeric-looking text arguments and unknown argument names. See the sibling
-Duell backend README's "Local PostgREST coexistence pilot" section and
-`backend/test/postgrest-pilot.mjs`. This establishes a viable local experiment;
-neither beta routing nor this module's acquisition behavior was changed.
+Application-specific coexistence experiments and rollout evidence belong to
+the consuming application repositories. The module regression command and
+current behavior are documented above.

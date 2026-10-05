@@ -1,115 +1,38 @@
 # PostgREST 16.4 compatibility
 
-The target is interchangeable database API execution, including commands:
-route an individual request to either engine without a per-RPC allowlist or a
-read/write split. Each request executes once. Never mirror writes or replay an
-uncertain write on the other engine.
+The module targets interchangeable database API behavior with PostgREST 16.4,
+including reads and commands. Compatibility remains partial: supported behavior
+and unresolved features are listed below. Each request executes once; never
+mirror commands or replay an uncertain write on another engine.
 
-**The candidate passes the current Carve/Duell public API and protocol audit.**
-This is not certification of every PostgREST feature. The broader gaps below
-remain explicit. The old Duell read-cohort proposal is superseded as a target;
-no candidate binary or PostgREST topology has been deployed to beta.
+## Running module tests
 
-## Reproduction and evidence
-
-Build from `nginz`, then run the audit from the sibling `duell` checkout:
+From the nginz checkout:
 
 ```sh
-zig build -Doptimize=ReleaseSmall
-zig build test -Doptimize=ReleaseSmall
-# In ../duell:
-PGREST_COMPATIBILITY_STRICT=1 npm run backend:test:postgrest-compatibility
+bun test tests/pgrest
 ```
 
-The runner is `duell/backend/test/postgrest-compatibility.mjs`; the independent
-SQL protocol fixture is `nginz/tests/pgrest/postgrest-fixture.mjs`. It compares:
+The normal test preload builds nginz. The suite includes mock-protocol tests,
+real PostgreSQL integration/security/serialization tests, and all nine acquisition
+queue scenarios. No application checkout, credentials, configuration, container
+or saved settings are required. See [test prerequisites](../../../tests/pgrest/README.md).
+The real-database tests use the existing `pgrest-nginz-test` PostgreSQL fixture
+at 127.0.0.1:5432; retain its named data volume. Queue tests run a dedicated local
+nginz process on an ephemeral port, create their own temporary database and role,
+and stop/drop only resources created by that test run.
 
-1. Unchanged beta image `registry.cn-shanghai.aliyuncs.com/darkanchor/nginz:1.30`,
-   image ID `17a8528eb4c666624e7cb1c51b489982a4ad38a7b59651349622586ff23573d5`.
-2. The locally built candidate with its executable/dependency hashes recorded.
-   Its host-built library closure is carried in the test volume; it is distinct
-   from the beta image's executable.
-3. `postgrest/postgrest:v16.4`, verified using `--version`, as behavioral oracle.
+The queue suite records private reports and logs under
+`$XDG_STATE_HOME/nginz/tests/pgrest-queue/<run>/`, defaulting to
+`~/.local/state/nginz/tests/pgrest-queue/<run>/`. Its 60-second saturation test
+runs by default, with no opt-in flag. `PGREST_QUEUE_SOAK_SECONDS` may extend
+that duration to at most 3,600 seconds. Tests fail when required infrastructure
+is unavailable; they do not silently skip queue or database coverage.
 
-Source study uses `/home/kaiwu/Documents/github/postgrest` (`Plan.hs`, `Query.hs`,
-`Error.hs` and the vendored Hasql pool). That checkout need not be the image's
-exact revision: disputed behavior is checked against the pinned executable.
-
-All container runtime files use the existing `nginz_test_runtime` named volume.
-PostgreSQL reuses `pgrest-nginz-test` and its named data volume. The runner reuses
-`duell-postgrest-nginz-pilot`, `duell-postgrest-pilot` and
-`duell-postgrest-nginz-candidate`, refusing already-running fixtures. It stops
-only fixtures it started, removes only its temporary databases/roles, and
-retains containers/volumes. It changes no beta service.
-
-Reports live under
-`~/.local/state/duell/local/evidence/postgrest-compatibility/<run>/report.json`.
-`status: completed` only means the run finished; require
-`acceptance.interchangeable: true` and `cleaned: true`. The report retains status,
-body, selected headers, catalog signatures, workflow coverage and cleanup.
-JSON object ordering is ignored and UTF-8 charset spelling is normalized.
-Generated IDs/timestamps are not stripped to manufacture equality: workflows
-assert their semantics on separate clones and then on a shared database.
-
-The 2026-10-05 run `20261005064735719-142640` passed 2,397 checks and 180 direct
-comparisons with **zero status/body differences and zero selected-header
-differences**. Candidate SHA-256:
-`cca79070b9e2770fabd4a3dd8cb5153c205691cc4cc8ad14361876f7c6a98405`.
-All 318 tests in `ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest` passed,
-including real-PostgreSQL security/serialization suites and the updated wire
-mock fixtures. Zig unit tests, Duell `npm run check` and
-`npm run backend:check` also passed. The run cleaned its temporary databases and
-roles, left all three pilot containers stopped and retained the named volumes.
-
-## Application coverage
-
-Inventory comes from migrated `pg_proc` and actual grants, not a selected read
-list. Private provider, payment and maintenance helpers stay private integrations.
-
-Carve's `carve_public` exposes all four of `public_account`, `save_profile`,
-`receipts` and `recordings`. Fixtures include profile writes, Premium owned
-recordings, two nonempty pages with encoded timestamp cursors, receipts, invalid
-inputs and denial for a second owner without entitlement. Its `carve_api`
-integration helpers are outside this public fallback.
-All four also pass on one database with native writes read by PostgREST,
-PostgREST writes read by native, and recording pagination crossing engines.
-
-Duell's `duell_api` exposes 55 functions:
-
-```
-account profile receipts
-game_create game_finalize game_lock game_pause game_provision game_read
-game_reopen game_resume game_retire game_setup_read game_setup_update
-game_unlock game_update my_games my_series
-play_correct play_record play_void
-player_join_game player_join_series player_quit_game player_quit_series
-rule_action_type rule_create rule_read rule_seal rule_update
-scorekeeper_join scorekeeper_leave scorekeeper_list
-series_complete series_create series_lock series_plan series_player_stats_read
-series_read series_reopen series_results_read series_retire
-series_teams_reorder series_teams_shuffle series_unlock series_update
-sports_read team_create team_delete team_read team_update
-venue_create venue_list venue_retire venue_update
-```
-
-Existing sporting, series, reports, registration and endpoint workflows pass
-on each engine independently and with individual requests distributed between
-engines on one database. All 55 functions have successful calls in each mode;
-minimum-input rejection probes do not count as success. The mixed workflows
-exercise command visibility, locking, concurrent scoring/creation, idempotency,
-permissions, revisions, reports and retirement. New uncovered functions fail
-the inventory check.
-
-Duell business rejections deliberately remain `{ok:false,status,code}` with
-HTTP 200. Workflow assertions inspect the embedded business status; differential
-probes retain actual HTTP status. No proxy rewrites business failures.
-
-Both apps' existing SQL identity helpers consume raw `request.jwt`. The test
-PostgREST pre-request bridge supplies it transaction-locally after checking
-verified claims, roles and authenticator identity. Native JWT guards and fixed
-app schemas remain in front of both engines. A production PostgREST deployment
-must package this bridge or migrate the shared identity contract; merely
-pointing proxy_pass at an unconfigured PostgREST container is insufficient.
+The synthetic SQL definitions in `tests/pgrest/postgrest-fixture.mjs` are also
+available to downstream differential audits. Application catalogs, business
+workflows and deployment evidence belong to those applications; passing them
+does not establish universal module compatibility.
 
 ## Implemented corrections
 
@@ -152,19 +75,34 @@ waiter count; use consistent caps for locations sharing a pool. An acquisition
 timeout can vary by location. A full or disabled queue returns 504/PGRST003
 immediately. The DB I/O timeout is separate.
 
-Tests send 20 simultaneous 100 ms queries successfully through both candidate
-and PostgREST; sustained pressure expires with the same 504/PGRST003 contract
-and the pool recovers. These controlled waits establish queue behavior, not
-beta throughput or safe production connection counts.
+The queue regression is `tests/pgrest/pgrest.queue.container.test.js`, discovered
+by the standard command above. A one-worker, one-slot pool and an external
+advisory lock establish occupancy; debug queue events prove admission before a
+fault is injected, and a SQL ledger checks order and side effects.
 
-Lifecycle coverage includes njs subrequests (success, missing function,
-application error and acquisition timeout), SSI, auth_request, twenty in-flight
-requests across graceful reload, twenty-four abandoned reads and recovery.
-The libpq loop drains every result without blocking, preserves setup errors,
-and wakes posted parent requests on every completion path. Tests reject worker
-crashes and nginx request-count/header alerts. Abandoned-read recovery does not
-establish that a disconnected write was cancelled: never infer non-commit from
-a transport failure.
+| Scenario | Required result |
+| --- | --- |
+| Queue cap, queue size 0, acquisition timeout 0 | 504/PGRST003; rejected writes never execute |
+| FIFO across locations and arrivals during drain | Committed order preserves admitted order, including newcomers |
+| Queued reads/writes and njs parent disconnect | Waiters removed before the busy slot is released; cancelled writes absent |
+| HTTP/2 RST_STREAM | Cancelled waiter removed; sibling stream still succeeds |
+| Active client cancellation | Unfinished transaction rolls back; next waiter can acquire immediately |
+| Thirty slot-release/deadline races | Both 200 and 504 outcomes; database effects match each response exactly once; recovery works |
+| PostgreSQL backend termination with waiters | Active request fails and rolls back; queued work reconnects and succeeds |
+| Graceful reload with six confirmed waiters | Old worker drains FIFO and exits; new worker serves requests |
+| Sustained saturation after warm-up | No request failures, worker replacement or unbounded RSS/descriptor/connection growth; bounded p99 |
+
+This suite exposed missing disconnect monitoring/HTTP cleanup. The fix uses
+nginx's protocol-aware abort handler and registers cleanup before asynchronous
+work. Cleanup removes queued timers and posted callbacks before request-pool
+memory can be freed, and closes an active libpq connection to roll back pending
+work. Request-count holds alone do not protect against forced HTTP termination.
+
+These are bounded regression tests. HTTP/3 aborts, a whole-server PostgreSQL
+outage and long-duration production behavior remain outside this suite.
+Cancellation checks prove pre-dispatch cancellation and rollback of deliberately
+blocked active transactions. A transport failure after commit cannot establish
+non-commit; never replay an uncertain write automatically.
 
 ## Rollout and remaining scope
 
@@ -172,10 +110,8 @@ This changes wire behavior: typed fields replace stringified numbers/booleans,
 scalar unwrapping defaults on, mutations default to minimal responses, and SQL
 errors expose PostgREST details instead of the old sanitized error object.
 Explicit `pgrest_json_scalar off` retains the legacy scalar wrapper and is not
-the tested compatibility profile. Carve's live clients and private integrations
-need regression verification when packaging an image rollout. Keep the previous
-image/recovery snapshot and the existing app migration/deployment safeguards.
-The existing beta image still has immediate saturation 503 behavior.
+the tested compatibility profile. Applications must verify their own API and
+identity contracts when upgrading the module or changing database gateways.
 
 Universal PostgREST parity is **not yet established**. Remaining general areas
 include transaction preferences, default-primary-key upsert inference, computed
@@ -187,9 +123,6 @@ Table writes and query grammar also retain the explicit parser/size limits in
 README. These are not exceptions to the target; they need oracle cases and
 implementation before advertising arbitrary PostgREST API compatibility.
 
-The acceptance gate currently covers every public RPC used by these two apps
-plus the synthetic protocol corpus. It is evidence for routing their ordinary
-DB calls through either properly configured engine, without per-RPC exceptions;
-it is not evidence for untested future features. Broaden the same strict gate
-when the API surface changes. No extra client requests, Redis lookups, provider
-calls, app migrations or beta topology changes were introduced by this work.
+Add module regressions when expanding the supported protocol surface. Applications
+should also test their own endpoint contracts and database effects through both
+engines; application tests supplement the public module suite.

@@ -222,6 +222,9 @@ pub const ngx_http_parse_status_line = ngx.ngx_http_parse_status_line;
 pub const ngx_http_parse_request_line = ngx.ngx_http_parse_request_line;
 pub const ngx_http_run_posted_requests = ngx.ngx_http_run_posted_requests;
 pub const ngx_http_request_empty_handler = ngx.ngx_http_request_empty_handler;
+// Core's protocol-aware client-abort detector (HTTP/1, HTTP/2 and HTTP/3).
+pub extern fn ngx_http_test_reading(r: [*c]ngx_http_request_t) callconv(.c) void;
+pub extern fn ngx_http_block_reading(r: [*c]ngx_http_request_t) callconv(.c) void;
 pub const ngx_http_read_client_request_body = ngx.ngx_http_read_client_request_body;
 pub const ngx_http_discard_request_body = ngx.ngx_http_discard_request_body;
 pub const ngx_http_upstream_hide_headers_hash = ngx.ngx_http_upstream_hide_headers_hash;

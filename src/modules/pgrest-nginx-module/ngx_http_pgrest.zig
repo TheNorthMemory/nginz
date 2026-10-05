@@ -256,6 +256,7 @@ const PgRequestCtx = extern struct {
     wait_previous: ?*PgRequestCtx,
     wait_next: ?*PgRequestCtx,
     wait_event: ngx_event_t,
+    cleanup_registered: bool,
     pool_conn: ?*PgPoolConn, // Assigned connection from pool
     query_state: PgQueryState, // Current query execution state
     rpc_phase: RpcExecutionPhase,
@@ -2260,6 +2261,30 @@ fn wrap_counted_query(ctx: *PgRequestCtx) bool {
 }
 
 fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ngx_int_t {
+    const r = ctx.*.request.?;
+    if (!ctx.*.cleanup_registered) {
+        // Request holds alone do not protect callbacks during forced nginx
+        // termination: core runs HTTP cleanups, then resets main->count to 1.
+        const cleanup = http.ngx_http_cleanup_add(r, 0);
+        if (cleanup == null) return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+        cleanup.*.handler = pooled_request_cleanup;
+        cleanup.*.data = ctx;
+        ctx.*.cleanup_registered = true;
+        // Body reading is complete before pgrest starts. Let nginx detect EOF
+        // while SQL/queue work is pending. Keep a parent's custom read handler
+        // (e.g. upstream/body processing), but replace the default no-op.
+        r.*.read_event_handler = http.ngx_http_test_reading;
+        const main = r.*.main;
+        if (main.*.read_event_handler == http.ngx_http_block_reading and
+            !main.*.flags1.reading_body and !main.*.flags1.discard_body)
+        {
+            main.*.read_event_handler = http.ngx_http_test_reading;
+        }
+        // Multiplexed requests use synthetic connections; their protocol
+        // handlers own readiness and stream-reset notification.
+        if (r.*.stream == null and r.*.connection.*.quic == null and
+            http.ngx_handle_read_event(r.*.connection.*.read, 0) != core.NGX_OK) return core.NGX_ERROR;
+    }
     const conninfo = core.slicify(u8, loc_conf.*.conninfo.data, loc_conf.*.conninfo.len);
     const max_conn: usize = if (loc_conf.*.pool_size > 0)
         @intCast(loc_conf.*.pool_size)
@@ -2387,6 +2412,18 @@ fn hold_pooled_request(ctx: *PgRequestCtx) void {
     ctx.*.count_held = 1;
 }
 
+fn pooled_request_cleanup(data: ?*anyopaque) callconv(.c) void {
+    const ctx = core.castPtr(PgRequestCtx, data) orelse return;
+    if (ctx.*.request == null) return;
+    const waiting_pool = ctx.*.wait_pool;
+    trace_pool_event(ctx, ctx.*.pool_conn, if (waiting_pool != null) "queue-cancel" else "request-cancel");
+    ctx.*.request = null;
+    // Unlink timers and posted events before request-pool memory is freed;
+    // close an active connection to roll back its unfinished transaction.
+    release_pooled_ctx(ctx, true);
+    if (waiting_pool) |pool| wake_pool_waiter(pool);
+}
+
 fn release_request_hold(ctx: *PgRequestCtx) void {
     // Preserve the final subrequest hold for nginx's own post-subrequest
     // decrement. Main requests, including queue timeouts, release their hold.
@@ -2422,7 +2459,10 @@ fn pool_acquisition_error(r: [*c]ngx_http_request_t) ngx_int_t {
 
 fn enqueue_pool_waiter(ctx: *PgRequestCtx, pool: *PgConnPool, lc: *ngx_pgrest_loc_conf_t) ngx_int_t {
     const limit: usize = @intCast(@max(lc.*.pool_queue_size, 0));
-    if (pool.wait_count >= limit or lc.*.pool_acquisition_timeout == 0) return pool_acquisition_error(ctx.*.request.?);
+    if (pool.wait_count >= limit or lc.*.pool_acquisition_timeout == 0) {
+        trace_pool_event(ctx, null, "queue-full");
+        return pool_acquisition_error(ctx.*.request.?);
+    }
     ctx.*.wait_pool = pool;
     ctx.*.wait_previous = pool.wait_tail;
     ctx.*.wait_next = null;
@@ -2435,6 +2475,7 @@ fn enqueue_pool_waiter(ctx: *PgRequestCtx, pool: *PgConnPool, lc: *ngx_pgrest_lo
     ctx.*.wait_event.log = http.ngx_cycle.*.log;
     hold_pooled_request(ctx);
     event.ngx_event_add_timer(&ctx.*.wait_event, lc.*.pool_acquisition_timeout);
+    trace_pool_event(ctx, null, "queue-enter");
     wake_pool_waiter(pool);
     return core.NGX_DONE;
 }
@@ -2444,6 +2485,7 @@ fn pool_wait_handler(ev: [*c]ngx_event_t) callconv(.c) void {
     const r = ctx.*.request orelse return;
     const expired = ev.*.flags.timedout;
     const pool = ctx.*.wait_pool.?;
+    trace_pool_event(ctx, null, if (expired) "queue-expired" else "queue-wake");
     unlink_pool_waiter(ctx);
     const lc = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module)).?;
     const rc = if (expired) pool_acquisition_error(r) else if (r.*.connection.*.flags.@"error") core.NGX_ERROR else start_pooled_request(ctx, lc);
