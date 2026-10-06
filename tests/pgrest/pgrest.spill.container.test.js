@@ -94,7 +94,7 @@ async function release() {
     p.stdin.end('SELECT pg_advisory_unlock(792415);\n\\q\n'); await exit;
 }
 async function blocked(label) {
-    await gate(); const h = write(label, { body:{label,gate:true} });
+    await gate(); const h = call('/blocker/rpc/write', { method:'POST', body:{label,gate:true} });
     await until(() => sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND application_name='spill_native' AND wait_event='advisory'") === '1', 'native occupies slot');
     return h;
 }
@@ -105,7 +105,9 @@ async function queued(path, options) {
 const guard = () => `jwt_secret "${secret}"; jwt_audience spill; jwt_require_claim role eq ${id}; jwt_require_claim oid !eq ""; jwt_validate_exp on; jwt_validate_sig on; jwt_phase preaccess;`;
 const native = () => `pgrest_pass "host=${fixture.host} port=${fixture.postgresPort} dbname=${id} user=${id} password=${password} application_name=spill_native"; pgrest_schemas spill; pgrest_pool_size 1; pgrest_jwt_secret "${secret}"; pgrest_json_scalar on;`;
 function config() {
-    const locations = [ ['api',8,'200ms','@backup','2s'], ['off',8,'60ms','off','2s'], ['full',0,'200ms','@backup','2s'], ['zero',8,'0','@backup','2s'], ['missing',8,'50ms','@missing','2s'], ['loop',8,'50ms','@loop','2s'], ['down',8,'50ms','@down','2s'], ['timeout',8,'200ms','@backup','60ms'], ['race',8,'60ms','@backup','2s'] ].map(([name, cap, delay, fallback, timeout]) =>
+    // The blocker shares the native pool, with time for Docker probes and the
+    // backup's acquisition timeout before the test explicitly releases its lock.
+    const locations = [ ['blocker',0,'0','off','10s'], ['api',8,'200ms','@backup','2s'], ['off',8,'60ms','off','2s'], ['full',0,'200ms','@backup','2s'], ['zero',8,'0','@backup','2s'], ['missing',8,'50ms','@missing','2s'], ['loop',8,'50ms','@loop','2s'], ['down',8,'50ms','@down','2s'], ['timeout',8,'200ms','@backup','60ms'], ['race',8,'60ms','@backup','2s'] ].map(([name, cap, delay, fallback, timeout]) =>
         `location /${name}/ { ${guard()} rewrite ^/${name}/(.*)$ /$1 break; ${native()} pgrest_timeout ${timeout}; pgrest_pool_acquisition_timeout ${delay}; pgrest_pool_queue_size ${cap}; pgrest_pool_fallback ${fallback}; add_header X-Spill-Backend native always; }`).join('\n');
     return `${process.getuid()===0?'user root;':''} worker_processes 1; pid ${runtime}/nginx.pid; error_log ${runtime}/error.log debug;
     events { worker_connections 1024; } http { access_log off; client_max_body_size 64k; client_body_buffer_size 1k;
@@ -215,11 +217,16 @@ scenario('missing target, reentry and unavailable PostgREST fail once without SQ
 });
 scenario('PostgREST acquisition timeout is returned with no retry',async()=>{
     const active=await blocked('backup-full-active');
-    const busy=call('/full/rpc/read?delay=1.5');
-    await until(()=>sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND application_name<>'spill_native' AND wait_event='PgSleep'")==='1','backup occupied');
+    // Hold the backup slot until its acquisition error arrives, independent of
+    // Docker polling latency. Both occupants wait on the same advisory lock.
+    const busy=call('/full/rpc/write',{method:'POST',body:{label:'backup-full-busy',gate:true}});
+    await until(()=>sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND application_name='spill_backup' AND wait_event='advisory'")==='1','backup occupied');
+    const n=events('pool-spill');
     const r=await call('/full/rpc/write',{method:'POST',body:{label:'backup-rejected'}}).promise;
-    assert.equal(r.status,504);assert.equal(r.data.code,'PGRST003');assert.equal(count('backup-rejected'),0);
-    await ok(busy,'postgrest');await release();await ok(active);
+    assert.equal(r.status,504,JSON.stringify(r));assert.equal(r.data.code,'PGRST003');assert.equal(r.headers['x-spill-backend'],'postgrest');assert.equal(count('backup-rejected'),0);
+    await release();await Promise.all([ok(busy,'postgrest'),ok(active,'native')]);
+    assert.equal(events('pool-spill'),n+1,'rejected request spills once');
+    assert.equal(count('backup-full-busy'),1);assert.equal(count('backup-rejected'),0,'rejected write never executes after release');
 });
 scenario('njs, SSI and auth subrequests complete through native named-location handoff',async()=>{
     const active=await blocked('subrequests-active');

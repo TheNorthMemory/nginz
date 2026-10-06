@@ -24,6 +24,8 @@ const report = { status: 'running', checks: 0, scenarios: [] };
 let nginz, databaseCreated = false, roleCreated = false, port, gateProcess;
 const pending = new Map();
 const soakSeconds = Number(process.env.PGREST_QUEUE_SOAK_SECONDS || 60);
+const raceDeadlineMs = 80;
+const raceReleaseOffsets = [-80,-4,-1,0,1,4,20];
 const redact = s => String(s).replaceAll(password, '[redacted]');
 const lit = s => "'" + String(s).replaceAll("'", "''") + "'";
 function docker(args, input) {
@@ -34,9 +36,9 @@ function docker(args, input) {
 const sqlArgs = adminArgs;
 const sql = (text, db = id) => docker(sqlArgs(db), text);
 function check(actual, expected, message) { assert.deepEqual(actual, expected, message); report.checks++; }
-async function until(predicate, label, timeout = 5000) {
+async function until(predicate, label, timeout = 5000, pollMs = 10) {
     const end = Date.now() + timeout;
-    while (Date.now() < end) { if (await predicate()) return; await Bun.sleep(10); }
+    while (Date.now() < end) { if (await predicate()) return; await Bun.sleep(pollMs); }
     throw Error('Timed out: ' + label);
 }
 function put(files) {
@@ -77,7 +79,29 @@ function h2Call(session, label) {
     return {promise,cancel(){stream.close(constants.NGHTTP2_CANCEL);}};
 }
 async function ok(handle, label) { const r = await handle.promise; check(r.status, 200, label + ': ' + JSON.stringify(r)); return r; }
-function ledger(prefix) { return JSON.parse(sql(`SELECT coalesce(jsonb_agg(label ORDER BY seq),'[]') FROM queue.ledger WHERE label LIKE ${lit(prefix + '%')}`)); }
+const ledgerQuery = prefix => `SELECT coalesce(jsonb_agg(label ORDER BY seq),'[]') FROM queue.ledger WHERE label LIKE ${lit(prefix + '%')}`;
+function ledger(prefix) { return JSON.parse(sql(ledgerQuery(prefix))); }
+async function raceControlConnection() {
+    const client=new Bun.SQL({
+        adapter:'postgres',hostname:fixture.host,port:fixture.port,
+        database:id,username:id,password,max:1,connectionTimeout:5,
+    });
+    let connection;
+    const query_ms=[];
+    const close=async()=>{try{connection?.release();}finally{await client.close({timeout:0});}};
+    try {
+        connection=await client.reserve();
+        const query=async text=>{
+            const start=performance.now();
+            const result=(await connection.unsafe(text).values())[0]?.[0];
+            query_ms.push({sql:text.split('(')[0],ms:performance.now()-start});return result;
+        };
+        await query("SET application_name='queue_gate'");
+        await query("SET statement_timeout='5s'");
+        return {query,close,query_ms};
+    }
+    catch(error){await close();throw error;}
+}
 async function gate() {
     assert(!gateProcess);
     const [command, ...prefix] = dockerCommand();
@@ -117,7 +141,7 @@ function scenario(name, run, timeout = 20000, requiresProc = false) {
 }
 const dsn = `host=${fixture.host} port=${fixture.port} dbname=${id} user=${id} password=${password}`;
 function config(debug = true) {
-    const routes = [['api',128,'5s'],['sibling',128,'5s'],['cap',2,'5s'],['off',0,'5s'],['zero',128,'0'],['race',128,'1s']].map(([route, size, timeout]) =>
+    const routes = [['api',128,'5s'],['sibling',128,'5s'],['cap',2,'5s'],['off',0,'5s'],['zero',128,'0'],['race',128,`${raceDeadlineMs}ms`]].map(([route, size, timeout]) =>
         `location /${route}/ { rewrite ^/${route}/(.*)$ /$1 break; pgrest_pass "${dsn}"; pgrest_schemas queue; pgrest_pool_size 1; pgrest_pool_queue_size ${size}; pgrest_pool_acquisition_timeout ${timeout}; pgrest_json_scalar on; }`).join('\n');
     return `${process.getuid() === 0 ? 'user root;' : ''} worker_processes 1; pid ${runtime}/nginx.pid; error_log ${logPath} ${debug ? 'debug' : 'warn'};
     events { worker_connections 1024; } http { access_log off; js_engine qjs; js_import audit from ${runtime}/queue.mjs;
@@ -248,23 +272,35 @@ afterAll(async () => {
         check(ledger('active-'),['active-survivor'],'cancelled active write rolled back');
     });
     scenario('slot release versus acquisition deadline; no duplicate execution or stale timers', async entry => {
-        entry.outcomes={success:0,timeout:0};entry.attempts=[];
-        for(let i=0;i<30;i++) {
-            const prefix='race-'+i+'-', active=await blocked(prefix+'active');
-            const before=events('queue-enter'), begin=Date.now(), waiter=call(prefix+'wait',{route:'race'});
-            await until(()=>events('queue-enter')>before,'race queued');
-            const offset=[-500,-40,-5,0,5,40,200][i%7];
-            await Bun.sleep(Math.max(0,begin+1000+offset-Date.now()));
-            const released=Date.now()-begin;await release();
-            await ok(active,'race blocker'); const r=await waiter.promise;
-            entry.attempts.push({release_ms:released,status:r.status,response_ms:r.ms});
-            assert([200,504].includes(r.status),JSON.stringify(r)); report.checks++;
-            if(r.status===200)entry.outcomes.success++;else {entry.outcomes.timeout++;check(r.body.code,'PGRST003','race timeout');}
-            check(ledger(prefix),[prefix+'active',...(r.status===200?[prefix+'wait']:[])],'race database exactly matches response');
-            await ok(call(prefix+'recovery'),'race recovery');
-        }
-        check(entry.outcomes.success>0,true,'both race outcomes: success');check(entry.outcomes.timeout>0,true,'both race outcomes: timeout');
-        await Bun.sleep(1100); await ok(call('race-final',{read:true}),'no late callback failure');
+        entry.acquisition_deadline_ms=raceDeadlineMs;entry.outcomes={success:0,timeout:0};entry.attempts=[];
+        // Reuse the control session for all 30 races, including occupancy probes
+        // and each ledger assertion, so Docker startup is outside the race loop.
+        const control=await raceControlConnection();
+        entry.control_query_ms=control.query_ms;
+        try {
+            for(let i=0;i<30;i++) {
+                const cycleBegin=performance.now();
+                const prefix='race-'+i+'-';
+                await control.query('SELECT pg_advisory_lock(913724)');
+                const active=call(prefix+'active',{gate:true});
+                await until(async()=>String(await control.query(`SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND usename=${lit(id)} AND wait_event='advisory'`))==='1','active request owns slot',5000,1);
+                const before=events('queue-enter'), begin=Date.now(), waiter=call(prefix+'wait',{route:'race'});
+                await until(()=>events('queue-enter')>before,'race queued',5000,1);
+                const offset=raceReleaseOffsets[i%raceReleaseOffsets.length];
+                const waitMs=Math.max(0,begin+raceDeadlineMs+offset-Date.now());
+                if(waitMs>0)await Bun.sleep(waitMs);
+                const released=Date.now()-begin;check(await control.query('SELECT pg_advisory_unlock(913724)'),true,'race gate released');
+                const activeResult=await ok(active,'race blocker'); const r=await waiter.promise;
+                const attempt={release_ms:released,status:r.status,response_ms:r.ms,active_ms:activeResult.ms};entry.attempts.push(attempt);
+                assert([200,504].includes(r.status),JSON.stringify(r)); report.checks++;
+                if(r.status===200)entry.outcomes.success++;else {entry.outcomes.timeout++;check(r.body.code,'PGRST003','race timeout');}
+                check(await control.query(ledgerQuery(prefix)),[prefix+'active',...(r.status===200?[prefix+'wait']:[])],'race database exactly matches response');
+                const recovery=await ok(call(prefix+'recovery'),'race recovery');
+                attempt.recovery_ms=recovery.ms;attempt.cycle_ms=performance.now()-cycleBegin;
+            }
+            check(entry.outcomes.success>0,true,'both race outcomes: success');check(entry.outcomes.timeout>0,true,'both race outcomes: timeout');
+            await Bun.sleep(raceDeadlineMs+50); await ok(call('race-final',{read:true}),'no late callback failure');
+        } finally {await control.close();}
     }, 90000);
     scenario('database backend loss with confirmed waiters; reconnect and rollback', async () => {
         const active=await blocked('db-active'), a=await queued('db-a'), b=await queued('db-b');
