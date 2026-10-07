@@ -51,6 +51,11 @@ export function ensureBuild() {
     const result = spawnSync(args, {
       stdout: "inherit",
       stderr: "inherit",
+      env: {
+        ...process.env,
+        ZIG_LOCAL_CACHE_DIR: join(process.cwd(), ".zig-cache"),
+        ZIG_GLOBAL_CACHE_DIR: join(process.cwd(), ".zig-cache", "global"),
+      },
     });
     if (result.exitCode !== 0) {
       throw new Error("zig build failed");
@@ -323,7 +328,7 @@ export async function waitForTCPPort(port, timeout = 10000) {
 }
 
 // Clean up runtime directory
-// Set KEEP_LOGS=1 to preserve runtime dir for debugging failed tests
+// Set KEEP_LOGS=1 to preserve runtime dir for debugging failed tests.
 export function cleanupRuntime(moduleName) {
   if (process.env.KEEP_LOGS) return;
   const runtimeDir = join(process.cwd(), "tests", moduleName, "runtime");

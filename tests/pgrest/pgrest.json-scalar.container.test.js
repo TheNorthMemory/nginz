@@ -1,7 +1,8 @@
 import { dockerCommand } from "../docker.js";
 import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { createTempDir, cleanupTempDir } from './runtime.js';
 import { join } from "node:path";
 import { startNginz, stopNginz, cleanupRuntime, testFetch } from "../harness.js";
 
@@ -49,9 +50,9 @@ describe.skipIf(Boolean(fixture.skip))("pgrest scalar JSON with real PostgreSQL"
       $$;
     `, RUN_NAME);
 
-    // Stage this suite's config beside the other test runtimes. The unchanged
-    // harness supplies the nginx prefix, including its logs and pid paths.
-    configDir = mkdtempSync(join(process.cwd(), "tests", MODULE, "runtime-scalar-config-"));
+    // Stage this suite's config beside the other test runtimes. The harness
+    // supplies the nginx prefix, including its logs and pid paths.
+    configDir = createTempDir('scalar-config');
     const configPath = join(configDir, "nginx.conf");
     const config = readFileSync(`tests/${MODULE}/nginx.json-scalar.conf`, "utf8")
       .replaceAll("host=127.0.0.1 port=15432 dbname=testdb user=postgres",
@@ -70,8 +71,8 @@ describe.skipIf(Boolean(fixture.skip))("pgrest scalar JSON with real PostgreSQL"
       try {
         if (roleCreated) psql(`DROP ROLE ${RUN_NAME};`);
       } finally {
-        if (configDir) rmSync(configDir, { recursive: true, force: true });
-        cleanupRuntime(MODULE);
+        try { cleanupTempDir(configDir); }
+        finally { cleanupRuntime(MODULE); }
       }
     }
   }, 30000);

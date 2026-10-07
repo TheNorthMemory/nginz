@@ -4,25 +4,24 @@ import { beforeAll, afterAll, describe, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { Agent, request } from 'node:http';
 import { createServer } from 'node:net';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { postgresFixture, adminArgs, docker, explainSkip } from './container-fixture.js';
+import { createTempDir, cleanupTempDir } from './runtime.js';
 
 const fixture = await postgresFixture();
 explainSkip('subrequest', fixture);
 const id = 'subreq_' + randomBytes(6).toString('hex');
 const password = randomBytes(24).toString('hex');
-const runtime = resolve(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'nginz/tests/pgrest-subrequest', id);
 const binary = fileURLToPath(new URL('../../zig-out/bin/nginz', import.meta.url));
 const lit = x => "'" + String(x).replaceAll("'", "''") + "'";
 const sql = (text, database = id) => docker(adminArgs(database), text).trim();
 const agent = new Agent({ keepAlive: true, maxSockets: 1 });
 const pending = new Set();
-let port, nginz, roleCreated = false, databaseCreated = false;
+let runtime, port, nginz, nginzClosed, roleCreated = false, databaseCreated = false;
 
 function call(path, { method = 'GET', body, headers = {}, keepAlive = false } = {}) {
     const bytes = body === undefined ? undefined : JSON.stringify(body);
@@ -59,7 +58,7 @@ async function until(check, label) {
 
 describe.skipIf(Boolean(fixture.skip))('pgrest subrequests with real PostgreSQL', () => {
     beforeAll(async () => {
-        mkdirSync(runtime, { recursive: true, mode: 0o700 });
+        runtime = createTempDir('subrequest');
         const listener = createServer();
         await new Promise(done => listener.listen(0, '127.0.0.1', done));
         port = listener.address().port;
@@ -103,12 +102,13 @@ describe.skipIf(Boolean(fixture.skip))('pgrest subrequests with real PostgreSQL'
                 location = /mirror { mirror /db/rpc/write; mirror_request_body on; echozn "mirrored"; }
             } }`, { mode: 0o600 });
         nginz = spawn(binary, ['-p', runtime, '-c', join(runtime, 'nginx.conf'), '-g', 'daemon off;'], { stdio: ['ignore', 'ignore', 'pipe'] });
+        nginzClosed = new Promise(done => nginz.once('close', done));
         let spawnError;
         nginz.on('error', error => { spawnError = error; });
         nginz.stderr.on('data', bytes => appendFileSync(join(runtime, 'stderr.log'), bytes, { mode: 0o600 }));
         await until(async () => {
             if (spawnError) throw spawnError;
-            if (nginz.exitCode !== null) throw Error('nginz exited during setup: ' + runtime);
+            if (nginz.exitCode !== null) throw Error('nginz exited during setup: ' + readFileSync(join(runtime, 'stderr.log'), 'utf8'));
             try { return (await call('/db/rpc/add_them?a=1&b=2')).status === 200; }
             catch (error) { if (error.code !== 'ECONNREFUSED') throw error; return false; }
         }, 'nginz ready');
@@ -116,21 +116,24 @@ describe.skipIf(Boolean(fixture.skip))('pgrest subrequests with real PostgreSQL'
 
     afterAll(async () => {
         const errors = [];
-        for (const req of pending) req.destroy();
-        agent.destroy();
-        if (nginz && nginz.exitCode === null && nginz.signalCode === null) {
-            const exited = new Promise(done => nginz.once('exit', done));
-            nginz.kill('SIGTERM');
-            const deadline = setTimeout(() => nginz.kill('SIGKILL'), 5000);
-            try { await exited; } finally { clearTimeout(deadline); }
-        }
+        try { for (const req of pending) req.destroy(); agent.destroy(); } catch (error) { errors.push(error); }
+        try {
+            if (nginz?.pid && nginz.exitCode === null && nginz.signalCode === null) {
+                nginz.kill('SIGTERM');
+                const deadline = setTimeout(() => nginz.kill('SIGKILL'), 5000);
+                try { await nginzClosed; } finally { clearTimeout(deadline); }
+            }
+            await nginzClosed;
+        } catch (error) { errors.push(error); }
         try { if (databaseCreated) sql(`DROP DATABASE ${id} WITH (FORCE)`, 'postgres'); } catch (error) { errors.push(error); }
         try { if (roleCreated) sql(`DROP ROLE ${id}`, 'postgres'); } catch (error) { errors.push(error); }
         try {
-            const path = join(runtime, 'error.log');
-            if (existsSync(path)) assert(!/\[(alert|emerg)\]|worker process .* exited on signal|request count is zero|header already sent/.test(readFileSync(path, 'utf8')), 'no nginx lifetime or header alerts: ' + path);
+            if (runtime) {
+                const path = join(runtime, 'error.log');
+                if (existsSync(path)) assert(!/\[(alert|emerg)\]|worker process .* exited on signal|request count is zero|header already sent/.test(readFileSync(path, 'utf8')), 'no nginx lifetime or header alerts');
+            }
         } catch (error) { errors.push(error); }
-        console.log('Subrequest evidence: ' + runtime);
+        try { cleanupTempDir(runtime); } catch (error) { errors.push(error); }
         if (errors.length) throw new AggregateError(errors, 'Subrequest cleanup/lifetime checks failed');
     }, 30000);
 

@@ -5,23 +5,19 @@ import { dockerCommand } from '../docker.js';
 import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { appendFileSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect, constants } from 'node:http2';
 import { createServer } from 'node:net';
-import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createTempDir, cleanupTempDir } from './runtime.js';
 
 const fixture=await postgresFixture(); explainSkip('queue',fixture);
 const hasProc=process.platform==='linux'&&existsSync(`/proc/${process.pid}/fd`);
-const state = resolve(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'nginz/tests/pgrest-queue');
 const id = 'queue_' + randomBytes(6).toString('hex'), password = randomBytes(24).toString('hex');
-const evidence = join(state, new Date().toISOString().replaceAll(/[^0-9]/g, '') + '-' + id);
-const runtime = join(evidence, 'runtime');
-const report = { status: 'running', checks: 0, scenarios: [] };
-let nginz, databaseCreated = false, roleCreated = false, port, gateProcess;
+let runtime, logPath, nginz, nginzClosed, databaseCreated = false, roleCreated = false, port, gateProcess;
 const pending = new Map();
 const soakSeconds = Number(process.env.PGREST_QUEUE_SOAK_SECONDS || 60);
 const raceDeadlineMs = 80;
@@ -35,7 +31,7 @@ function docker(args, input) {
 }
 const sqlArgs = adminArgs;
 const sql = (text, db = id) => docker(sqlArgs(db), text);
-function check(actual, expected, message) { assert.deepEqual(actual, expected, message); report.checks++; }
+function check(actual, expected, message) { assert.deepEqual(actual, expected, message); }
 async function until(predicate, label, timeout = 5000, pollMs = 10) {
     const end = Date.now() + timeout;
     while (Date.now() < end) { if (await predicate()) return; await Bun.sleep(pollMs); }
@@ -44,7 +40,6 @@ async function until(predicate, label, timeout = 5000, pollMs = 10) {
 function put(files) {
     for (const [name, data] of Object.entries(files)) writeFileSync(join(runtime, name), data, { mode: 0o600 });
 }
-const logPath = runtime + '/' + id + '.log';
 const logs = () => readFileSync(logPath, 'utf8');
 const events = name => (logs().match(new RegExp('event=' + name + ' ', 'g')) || []).length;
 function call(label, { route = 'api', gate = false, delay = 0, read = false } = {}) {
@@ -87,18 +82,13 @@ async function raceControlConnection() {
         database:id,username:id,password,max:1,connectionTimeout:5,
     });
     let connection;
-    const query_ms=[];
     const close=async()=>{try{connection?.release();}finally{await client.close({timeout:0});}};
     try {
         connection=await client.reserve();
-        const query=async text=>{
-            const start=performance.now();
-            const result=(await connection.unsafe(text).values())[0]?.[0];
-            query_ms.push({sql:text.split('(')[0],ms:performance.now()-start});return result;
-        };
+        const query=async text=>(await connection.unsafe(text).values())[0]?.[0];
         await query("SET application_name='queue_gate'");
         await query("SET statement_timeout='5s'");
-        return {query,close,query_ms};
+        return {query,close};
     }
     catch(error){await close();throw error;}
 }
@@ -131,13 +121,8 @@ async function queued(label, options = {}) {
 }
 function scenario(name, run, timeout = 20000, requiresProc = false) {
     const skip=requiresProc&&!hasProc;
-    if(skip){report.scenarios.push({name,status:'skipped',reason:'Linux /proc resource sampling unavailable'});console.warn('[pgrest queue] skipped: '+name+' (requires Linux /proc)');}
-    test.skipIf(skip)(name, async () => {
-        const entry = { name, status: 'running' }, before = report.checks, start = Date.now(); report.scenarios.push(entry);
-        try { await run(entry); entry.status = 'passed'; }
-        catch (e) { entry.status = 'failed'; entry.error = redact(e.stack); throw e; }
-        finally { entry.checks = report.checks - before; entry.ms = Date.now() - start; }
-    }, timeout);
+    if(skip)console.warn('[pgrest queue] skipped: '+name+' (requires Linux /proc)');
+    test.skipIf(skip)(name, run, timeout);
 }
 const dsn = `host=${fixture.host} port=${fixture.port} dbname=${id} user=${id} password=${password}`;
 function config(debug = true) {
@@ -159,12 +144,11 @@ function sample() {
 }
 describe.skipIf(Boolean(fixture.skip))('pgrest acquisition queue with real PostgreSQL', () => {
 beforeAll(async () => {
-    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    runtime = createTempDir('queue');
+    logPath = join(runtime, 'error.log');
     assert(Number.isFinite(soakSeconds) && soakSeconds >= 60 && soakSeconds <= 3600, 'PGREST_QUEUE_SOAK_SECONDS must be 60–3600');
-    report.postgres_image = fixture.info.Image; report.volume=fixture.mount.Name; report.postgres_host=fixture.host; report.postgres_port=fixture.port;
     // tests/preload.js builds this binary for the normal `bun test` command.
     const binaryPath = fileURLToPath(new URL('../../zig-out/bin/nginz', import.meta.url));
-    report.candidate_sha256 = createHash('sha256').update(readFileSync(binaryPath)).digest('hex');
     const listener = createServer(); await new Promise(done => listener.listen(0,'127.0.0.1',done)); port = listener.address().port; await new Promise(done => listener.close(done));
     sql(`CREATE ROLE ${id} LOGIN PASSWORD ${lit(password)}`, 'postgres'); roleCreated = true;
     sql(`CREATE DATABASE ${id}`, 'postgres'); databaseCreated = true;
@@ -175,12 +159,13 @@ beforeAll(async () => {
         CREATE FUNCTION queue.read(delay double precision DEFAULT 0) RETURNS integer STABLE LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(delay); RETURN 1; END $$;`);
     put({'nginx.conf':config(), 'queue.mjs':`async function call(r) { const reply = await r.subrequest('/api/rpc/write', {method:'POST',body:r.requestText}); r.return(reply.status,reply.responseText); } export default {call};\n`});
     nginz = spawn(binaryPath, ['-p', runtime, '-c', join(runtime,'nginx.conf'), '-g', 'daemon off;'], {stdio:['ignore','ignore','pipe']});
-    nginz.stderr.on('data', bytes => appendFileSync(join(evidence,'stderr.log'), bytes, {mode:0o600}));
+    nginzClosed = new Promise(done => nginz.once('close', done));
+    nginz.stderr.on('data', bytes => appendFileSync(join(runtime,'stderr.log'), bytes, {mode:0o600}));
     let spawnError;
     nginz.on('error', error => {spawnError = error;});
     await until(async () => {
         if (spawnError) throw spawnError;
-        if (nginz.exitCode !== null) throw Error('nginz exited during setup; see ' + join(evidence,'stderr.log'));
+        if (nginz.exitCode !== null) throw Error('nginz exited during setup: ' + readFileSync(join(runtime,'stderr.log'),'utf8'));
         return (await call('ready',{read:true}).promise).status === 200;
     }, 'nginz ready');
 }, 30000);
@@ -196,22 +181,18 @@ afterAll(async () => {
     try {for (const cancel of pending.values()) cancel(); await release();} catch (e) {failures.push(e);}
     if (nginz) {
         try {
-            if (nginz.exitCode === null && nginz.signalCode === null) {
-                const exited = new Promise(done => nginz.once('exit', done));
+            if (nginz.pid && nginz.exitCode === null && nginz.signalCode === null) {
                 nginz.kill('SIGTERM');
                 const deadline = setTimeout(() => nginz.kill('SIGKILL'), 5000);
-                try {await exited;} finally {clearTimeout(deadline);}
+                try {await nginzClosed;} finally {clearTimeout(deadline);}
             }
-            if(existsSync(logPath))check(/\[(?:alert|emerg)\]|signal 11|worker process .* exited on signal|request count is zero/i.test(logs()),false,'no crash or nginx lifetime alerts');
+            await nginzClosed;
+            if(logPath && existsSync(logPath))check(/\[(?:alert|emerg)\]|signal 11|worker process .* exited on signal|request count is zero/i.test(logs()),false,'no crash or nginx lifetime alerts');
         } catch (e) {failures.push(e);}
     }
     try {if (databaseCreated) sql(`DROP DATABASE ${id} WITH (FORCE)`,'postgres');} catch (e) {failures.push(e);}
     try {if (roleCreated) sql(`DROP ROLE ${id}`,'postgres');} catch (e) {failures.push(e);}
-    report.cleaned = failures.length === 0;
-    report.status = report.cleaned && report.scenarios.length === 9 && report.scenarios.every(s => ['passed','skipped'].includes(s.status)) ? 'passed' : 'failed';
-    if (failures.length) report.cleanup_errors = failures.map(e => redact(e.stack));
-    writeFileSync(join(evidence,'report.json'),JSON.stringify(report,null,2)+'\n',{mode:0o600});
-    console.log('Queue audit '+report.status+': '+join(evidence,'report.json'));
+    try {cleanupTempDir(runtime);} catch (e) {failures.push(e);}
     if (failures.length) throw new AggregateError(failures, 'Queue fixture cleanup failed');
 }, 30000);
 
@@ -271,15 +252,13 @@ afterAll(async () => {
         await ok(waiter,'waiter runs while advisory gate remains held');await release();
         check(ledger('active-'),['active-survivor'],'cancelled active write rolled back');
     });
-    scenario('slot release versus acquisition deadline; no duplicate execution or stale timers', async entry => {
-        entry.acquisition_deadline_ms=raceDeadlineMs;entry.outcomes={success:0,timeout:0};entry.attempts=[];
+    scenario('slot release versus acquisition deadline; no duplicate execution or stale timers', async () => {
+        const outcomes={success:0,timeout:0};
         // Reuse the control session for all 30 races, including occupancy probes
         // and each ledger assertion, so Docker startup is outside the race loop.
         const control=await raceControlConnection();
-        entry.control_query_ms=control.query_ms;
         try {
             for(let i=0;i<30;i++) {
-                const cycleBegin=performance.now();
                 const prefix='race-'+i+'-';
                 await control.query('SELECT pg_advisory_lock(913724)');
                 const active=call(prefix+'active',{gate:true});
@@ -289,16 +268,14 @@ afterAll(async () => {
                 const offset=raceReleaseOffsets[i%raceReleaseOffsets.length];
                 const waitMs=Math.max(0,begin+raceDeadlineMs+offset-Date.now());
                 if(waitMs>0)await Bun.sleep(waitMs);
-                const released=Date.now()-begin;check(await control.query('SELECT pg_advisory_unlock(913724)'),true,'race gate released');
-                const activeResult=await ok(active,'race blocker'); const r=await waiter.promise;
-                const attempt={release_ms:released,status:r.status,response_ms:r.ms,active_ms:activeResult.ms};entry.attempts.push(attempt);
-                assert([200,504].includes(r.status),JSON.stringify(r)); report.checks++;
-                if(r.status===200)entry.outcomes.success++;else {entry.outcomes.timeout++;check(r.body.code,'PGRST003','race timeout');}
+                check(await control.query('SELECT pg_advisory_unlock(913724)'),true,'race gate released');
+                await ok(active,'race blocker'); const r=await waiter.promise;
+                assert([200,504].includes(r.status),JSON.stringify(r));
+                if(r.status===200)outcomes.success++;else {outcomes.timeout++;check(r.body.code,'PGRST003','race timeout');}
                 check(await control.query(ledgerQuery(prefix)),[prefix+'active',...(r.status===200?[prefix+'wait']:[])],'race database exactly matches response');
-                const recovery=await ok(call(prefix+'recovery'),'race recovery');
-                attempt.recovery_ms=recovery.ms;attempt.cycle_ms=performance.now()-cycleBegin;
+                await ok(call(prefix+'recovery'),'race recovery');
             }
-            check(entry.outcomes.success>0,true,'both race outcomes: success');check(entry.outcomes.timeout>0,true,'both race outcomes: timeout');
+            check(outcomes.success>0,true,'both race outcomes: success');check(outcomes.timeout>0,true,'both race outcomes: timeout');
             await Bun.sleep(raceDeadlineMs+50); await ok(call('race-final',{read:true}),'no late callback failure');
         } finally {await control.close();}
     }, 90000);
@@ -321,24 +298,24 @@ afterAll(async () => {
         await until(()=>workers().every(pid=>!old.includes(pid)),'old worker exited',10000);
         await ok(call('reload-recovery',{read:true}),'new worker ready');
     },20000,true);
-    scenario('sustained saturation with bounded memory, descriptors and tail latency', async entry => {
+    scenario('sustained saturation with bounded memory, descriptors and tail latency', async () => {
         // No debug log I/O in measurements. Reload before warm-up, not during samples.
         const old=workers(); put({'nginx.conf':config(false)});
         nginz.kill('SIGHUP');
         await until(()=>workers().length===1&&workers()[0]!==old[0],'soak worker ready');
         const batch=async()=>Promise.all(Array.from({length:24},(_,i)=>call('soak',{read:true,delay:0.005,route:'api'}).promise));
         for(let i=0;i<8;i++){const rows=await batch();check(rows.every(r=>r.status===200),true,'warm-up');}
-        entry.baseline=sample();entry.samples=[];const latencies=[];const begin=Date.now();let batches=0;
+        const baseline=sample(),samples=[],latencies=[];const begin=Date.now();let batches=0;
         const duration=soakSeconds*1000;
         assert(duration>=60000,'soak must run for at least 60 seconds');
         while(Date.now()-begin<duration){
             const rows=await batch();check(rows.every(r=>r.status===200),true,'soak no loss/deadline');latencies.push(...rows.map(r=>r.ms));batches++;
-            if(batches%50===0){entry.samples.push(sample());console.log('Queue soak: '+latencies.length+' requests, '+Math.round((Date.now()-begin)/1000)+'s');}
+            if(batches%50===0){samples.push(sample());console.log('Queue soak: '+latencies.length+' requests, '+Math.round((Date.now()-begin)/1000)+'s');}
         }
-        await Bun.sleep(1000);entry.after=sample();entry.requests=latencies.length;entry.elapsed_ms=Date.now()-begin;
-        latencies.sort((a,b)=>a-b);entry.latency_ms=Object.fromEntries([50,95,99,100].map(p=>['p'+p,latencies[Math.min(latencies.length-1,Math.floor(latencies.length*p/100))]]));
-        for(const s of [...entry.samples,entry.after]){check(s.pid,entry.baseline.pid,'worker stable');check(s.connections,1,'one DB slot');check(s.fd<=entry.baseline.fd+2,true,'bounded descriptors');check(s.rssKiB<=entry.baseline.rssKiB+16384,true,'RSS within 16MiB after warm-up');}
-        check(entry.latency_ms.p99<2000,true,'p99 below 2s with 5s acquisition deadline');
+        await Bun.sleep(1000);samples.push(sample());
+        latencies.sort((a,b)=>a-b);const p99=latencies[Math.min(latencies.length-1,Math.floor(latencies.length*0.99))];
+        for(const s of samples){check(s.pid,baseline.pid,'worker stable');check(s.connections,1,'one DB slot');check(s.fd<=baseline.fd+2,true,'bounded descriptors');check(s.rssKiB<=baseline.rssKiB+16384,true,'RSS within 16MiB after warm-up');}
+        check(p99<2000,true,'p99 below 2s with 5s acquisition deadline');
         await ok(call('soak-recovery'),'post-soak write');
     }, (soakSeconds + 45) * 1000,true);
 });

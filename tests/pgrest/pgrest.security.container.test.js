@@ -1,14 +1,14 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { randomBytes, createHmac } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
+import { createTempDir, cleanupTempDir } from './runtime.js';
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { dockerCommand } from "../docker.js";
 import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL, stableFetch } from "../harness.js";
 
-const MODULE = "pgrest-security";
+const MODULE = "pgrest";
 const fixture=await postgresFixture(); explainSkip('security',fixture);
 const RUN = "pgrest_security_" + randomBytes(6).toString("hex");
 const AUTH = RUN + "_authenticator", USER = RUN + "_api", ANON = RUN + "_anon";
@@ -67,7 +67,7 @@ describe.skipIf(Boolean(fixture.skip))("pgrest SQL construction with real Postgr
       GRANT USAGE ON SCHEMA audit TO ${USER}; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA audit TO ${USER};
       GRANT SELECT,INSERT,UPDATE,DELETE ON audit.items TO ${USER};
       ALTER ROLE ${AUTH} SET standard_conforming_strings=off;`);
-    directory = mkdtempSync(join(tmpdir(), "nginz-pgrest-security-"));
+    directory = createTempDir('security-config');
     const jwt = `jwt_secret "${SECRET}"; jwt_issuer ${RUN}; jwt_audience fixture-api;
       jwt_require_claim sub eq fixture; jwt_require_claim role eq ${USER}; jwt_require_claim appid eq fixture-client;
       jwt_require_claim app eq ${RUN}; jwt_require_claim oid !eq ""; jwt_require_claim exp gt 0;
@@ -92,9 +92,11 @@ describe.skipIf(Boolean(fixture.skip))("pgrest SQL construction with real Postgr
     finally {
       try { if (database) sql(`DROP DATABASE ${RUN} WITH (FORCE);`, "postgres"); }
       finally {
-        if (roles) sql(`DROP ROLE ${AUTH}; DROP ROLE ${USER}; DROP ROLE ${ANON};`, "postgres");
-        if (directory) rmSync(directory, { recursive: true, force: true });
-        cleanupRuntime(MODULE);
+        try { if (roles) sql(`DROP ROLE ${AUTH}; DROP ROLE ${USER}; DROP ROLE ${ANON};`, "postgres"); }
+        finally {
+          try { cleanupTempDir(directory); }
+          finally { cleanupRuntime(MODULE); }
+        }
       }
     }
   }, 30000);

@@ -139,6 +139,11 @@ reason; assertion failures and errors after prerequisite discovery still fail.
 Cleanup must tolerate setup ending before processes, files or databases exist.
 `bun test tests/pgrest` runs its self-contained cases without Docker; see
 `tests/pgrest/README.md` for optional PostgreSQL/PostgREST fixture settings.
+Pgrest tests must keep generated files inside the project, create temporary
+directories only during a test run and remove them during teardown, even after
+failures, unless `KEEP_LOGS` is set to preserve runtime files for debugging.
+Do not retain evidence reports or write test files to the user's home or system
+temporary directories.
 
 Integration tests use Bun and run against a live nginx instance:
 If used wrong, bun test could introduce false positives by itself, use curl to double confirm.

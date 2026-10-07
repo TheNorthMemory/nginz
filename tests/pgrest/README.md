@@ -59,6 +59,14 @@ are announced once per suite and counted as skipped tests, so test results show
 which integration coverage actually ran. Cleanup handles partial setup without
 reading logs or deleting resources that were never created.
 
+Test files stay inside the project. Generated configurations, logs and request
+bodies use temporary runtime directories and are deleted during teardown,
+including after failures. Set `KEEP_LOGS=1` to preserve runtime directories,
+generated configurations and logs for debugging, as in the other test suites.
+Pgrest tests do not retain evidence reports or write to the user's home or
+system temporary directories. The build harness also keeps Zig caches inside
+the project's `.zig-cache` directory.
+
 ## Acquisition queue coverage
 
 `pgrest.queue.container.test.js` registers nine normal Bun tests:
@@ -83,11 +91,9 @@ assertion, avoiding Docker startup per query.
 Cleanup stops only this run's nginz and removes only its database/role.
 Existing containers and named volumes remain intact.
 
-Reports, configurations and logs are retained privately under
-`$XDG_STATE_HOME/nginz/tests/pgrest-queue/<run>/`, or
-`~/.local/state/nginz/tests/pgrest-queue/<run>/` by default. The report includes
-the binary hash, per-scenario results, latency percentiles and RSS/descriptor/
-database-connection samples. Set `PGREST_QUEUE_SOAK_SECONDS` to 60–3600 to
+Configurations and logs use a temporary `tests/pgrest/runtime-queue-*`
+directory, removed during teardown unless `KEEP_LOGS` is set. Resource samples
+and latency checks stay in memory. Set `PGREST_QUEUE_SOAK_SECONDS` to 60–3600 to
 extend the load test. The per-test deadline scales with that duration; the race
 test targets about four seconds locally and has its original 90-second test
 deadline.
@@ -111,9 +117,8 @@ the parent response. Worker logs are checked for lifetime and header alerts.
 No PostgREST image is required for these cases. Missing PostgreSQL prerequisites
 produce explicit skips; setup/assertion errors with available prerequisites
 fail. Cleanup stops only this run's process and drops its database and role.
-Configurations and logs remain private under
-`$XDG_STATE_HOME/nginz/tests/pgrest-subrequest/<run>/` (default
-`~/.local/state/nginz/tests/pgrest-subrequest/`).
+Configurations and logs use a temporary `tests/pgrest/runtime-subrequest-*`
+directory, removed during teardown unless `KEEP_LOGS` is set.
 
 ## Delayed spill coverage
 
@@ -129,8 +134,8 @@ the rejected write never executes after release. Native blocker requests use a
 separate 10-second I/O timeout to allow fixture coordination; ordinary routes
 use two seconds and the explicit I/O timeout case uses 60 ms.
 
-Reports live under `$XDG_STATE_HOME/nginz/tests/pgrest-spill/`
-(default `~/.local/state/nginz/tests/pgrest-spill/`). Cleanup stops only this
-run's nginz, removes its own PostgREST container and drops its own database and
+Configurations and logs use a temporary `tests/pgrest/runtime-spill-*`
+directory, removed during teardown unless `KEEP_LOGS` is set. Cleanup stops only
+this run's nginz, removes its own PostgREST container and drops its own database and
 role. The selected PostgreSQL fixture and named volumes are retained. Cleanup
 does not depend on setup having reached container startup or log creation.

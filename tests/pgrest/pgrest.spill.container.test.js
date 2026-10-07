@@ -5,26 +5,24 @@ import { beforeAll, afterAll, afterEach, describe, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect, constants } from 'node:http2';
 import { createServer, isIP } from 'node:net';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dockerCommand } from '../docker.js';
 import {postgresFixture,pgContainer,adminArgs,explainSkip} from './container-fixture.js';
 import {postgrestFixture,postgrestContainerArgs} from './postgrest-fixture.js';
+import {createTempDir,cleanupTempDir} from './runtime.js';
 
 const pg = pgContainer;
 const id = 'spill_' + randomBytes(5).toString('hex');
 const secret = randomBytes(32).toString('hex'), password = randomBytes(24).toString('hex');
-const runtime = resolve(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'nginz/tests/pgrest-spill', id);
 const binary = fileURLToPath(new URL('../../zig-out/bin/nginz', import.meta.url));
 const lit = x => "'" + String(x).replaceAll("'", "''") + "'";
-let port, backendPort, downPort, nginz, gateProcess, postgrestId, created = false, roleCreated = false;
-const pending = new Set(), scenarios = [];
-const report = { status: 'running', scenarios };
+let runtime, port, backendPort, downPort, nginz, nginzClosed, gateProcess, postgrestId, created = false, roleCreated = false;
+const pending = new Set();
 function docker(args, input, encoding = 'utf8') {
     const [command, ...prefix] = dockerCommand();
     return execFileSync(command, [...prefix, ...args], { input, encoding, timeout: 30000, maxBuffer: 64e6, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -122,18 +120,10 @@ function config() {
     location = /auth { auth_request /api/rpc/read; echozn "authorized"; }
     } }`;
 }
-function scenario(name, f, timeout = 20000) {
-    test(name, async () => {
-        const row = { name, status:'running' }; scenarios.push(row);
-        try { await f(); row.status = 'passed'; } catch(e) { row.status = 'failed'; row.error = String(e); throw e; }
-    }, timeout);
-}
 describe.skipIf(Boolean(fixture.skip))('native delayed spill to PostgREST 16.4', () => {
 beforeAll(async () => {
-    mkdirSync(runtime, {recursive:true,mode:0o700});
-    report.volume=fixture.mount.Name; report.network=fixture.network; report.postgres_host=fixture.host; report.postgres_port=fixture.postgresPort;
+    runtime=createTempDir('spill');
     [port, backendPort, downPort] = await Promise.all([freePort(),freePort(),freePort()]);
-    report.image = fixture.image;
     sql(`CREATE ROLE ${id} LOGIN PASSWORD ${lit(password)}`,'postgres'); roleCreated = true;
     sql(`CREATE DATABASE ${id}`,'postgres'); created = true;
     sql(`CREATE SCHEMA spill AUTHORIZATION ${id}; SET ROLE ${id};
@@ -142,7 +132,6 @@ beforeAll(async () => {
     CREATE FUNCTION spill.write(label text,gate boolean DEFAULT false,delay double precision DEFAULT 0,bad boolean DEFAULT false) RETURNS text LANGUAGE plpgsql AS $$ BEGIN IF gate THEN PERFORM pg_advisory_xact_lock(792415); END IF; PERFORM pg_sleep(delay); INSERT INTO spill.ledger(label) VALUES(write.label); IF bad THEN PERFORM set_config('response.status','invalid',true); END IF; RETURN label; END $$;
     CREATE FUNCTION spill.fail(code text) RETURNS text STABLE LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE=code,MESSAGE='fixture error'; END $$;`);
     postgrestId=docker(postgrestContainerArgs(fixture,{name:id+'-postgrest',database:id,password,secret,port:backendPort})).trim();
-    report.postgrest_container=postgrestId;
     docker(['start',postgrestId]);
     assert.equal(docker(['exec',postgrestId,'/bin/postgrest','--version']).trim(),'PostgREST 16.4');
     if(fixture.backup.publish){
@@ -153,6 +142,7 @@ beforeAll(async () => {
     writeFileSync(join(runtime,'nginx.conf'),config(),{mode:0o600});
     writeFileSync(join(runtime,'subrequest.mjs'),`async function call(r) { const s=await r.subrequest('/api/rpc/write',{method:'POST',body:r.requestText}); r.return(s.status,s.responseText); } export default {call};`,{mode:0o600});
     nginz = spawn(binary,['-p',runtime,'-c',join(runtime,'nginx.conf'),'-g','daemon off;'],{stdio:['ignore','ignore','pipe']});
+    nginzClosed=new Promise(done=>nginz.once('close',done));
     nginz.stderr.on('data',b=>appendFileSync(join(runtime,'stderr.log'),b,{mode:0o600}));
     await until(async()=>{if(nginz.exitCode!==null)throw Error(readFileSync(join(runtime,'stderr.log'),'utf8'));return (await call().promise).status===200;},'native ready');
     await until(async()=>(await call('/rpc/read',{hostname:fixture.backupHost,httpPort:backendPort}).promise).status===200,'PostgREST ready');
@@ -161,42 +151,48 @@ afterEach(async()=>{for(const r of pending)r.destroy(Error('test cleanup'));awai
 afterAll(async()=>{
     const failures=[];
     try {for(const r of pending)r.destroy();await release();}catch(e){failures.push(e);}
-    for(const p of [nginz]) if(p && p.exitCode===null && p.signalCode===null){const exit=new Promise(r=>p.once('exit',r));p.kill('SIGTERM');await exit;}
-    try {if(postgrestId)writeFileSync(join(runtime,'postgrest.log'),docker(['logs',postgrestId]),{mode:0o600});}catch(e){failures.push(e);}
+    try {
+        if(nginz?.pid && nginz.exitCode===null && nginz.signalCode===null){
+            nginz.kill('SIGTERM');
+            const deadline=setTimeout(()=>nginz.kill('SIGKILL'),5000);
+            try {await nginzClosed;}finally {clearTimeout(deadline);}
+        }
+        await nginzClosed;
+    }catch(e){failures.push(e);}
     try {if(postgrestId)docker(['rm','-f',postgrestId]);}catch(e){failures.push(e);}
-    try {if(created)sql(`DROP DATABASE ${id} WITH (FORCE)`,'postgres');if(roleCreated)sql(`DROP ROLE ${id}`,'postgres');}catch(e){failures.push(e);}
-    try {if(existsSync(join(runtime,'error.log')))assert(!/\[(alert|emerg)\]|worker process .* exited on signal|request count is zero/.test(log()),'no nginx lifetime alerts');}catch(e){failures.push(e);}
-    report.cleaned=failures.length===0;report.status=report.cleaned&&scenarios.length>0&&scenarios.every(s=>s.status==='passed')?'passed':'failed';
-    writeFileSync(join(runtime,'report.json'),JSON.stringify(report,null,2)+'\n',{mode:0o600});console.log('Spill audit '+report.status+': '+join(runtime,'report.json'));
+    try {if(created)sql(`DROP DATABASE ${id} WITH (FORCE)`,'postgres');}catch(e){failures.push(e);}
+    try {if(roleCreated)sql(`DROP ROLE ${id}`,'postgres');}catch(e){failures.push(e);}
+    try {if(runtime && existsSync(join(runtime,'error.log')))assert(!/\[(alert|emerg)\]|worker process .* exited on signal|request count is zero/.test(log()),'no nginx lifetime alerts');}catch(e){failures.push(e);}
+    try {cleanupTempDir(runtime);}catch(e){failures.push(e);}
     if(failures.length)throw new AggregateError(failures,'spill cleanup');
 },20000);
-scenario('free slots and slots released during the delay stay native',async()=>{
+test('free slots and slots released during the delay stay native',async()=>{
     await ok(call(),'native');const active=await blocked('short-active');
     const waiter=await queued('/api/rpc/write',{method:'POST',body:{label:'short-waiter'}});
     await release();await Promise.all([ok(active,'native'),ok(waiter,'native')]);assert.equal(count('short-waiter'),1);
-});
-scenario('delayed GET, HEAD and disk-buffered POST preserve identity, URI, headers and body',async()=>{
+},20000);
+test('delayed GET, HEAD and disk-buffered POST preserve identity, URI, headers and body',async()=>{
     const active=await blocked('preserve-active');
     const r=await ok(call('/api/rpc/read?value=a%2Bb%20%26%3F',{bearer:token('owner-b'),headers:{'x-test':'retained'}}),'postgrest');
     assert(r.ms>=170,'waited for acquisition deadline');assert.deepEqual(r.data,{value:'a+b &?',owner:'owner-b',method:'GET',header:'retained'});
     const h=await ok(call('/api/rpc/read',{method:'HEAD'}),'postgrest');assert.equal(h.data,'');
     const label='large-'+ 'x'.repeat(10000);const w=await ok(write(label),'postgrest');assert.equal(w.data,label);assert.equal(count(label),1);
     await release();await ok(active,'native');await Bun.sleep(250);assert.equal(count(label),1,'native never replays spilled write');
-});
-scenario('PATCH and DELETE retain their method, filters and Prefer header',async()=>{
+},20000);
+test('PATCH and DELETE retain their method, filters and Prefer header',async()=>{
     sql("INSERT INTO spill.ledger(label) VALUES('patch-me'),('keep-me')");const active=await blocked('methods-active');
     const r=await ok(call('/api/ledger?label=eq.patch-me',{method:'PATCH',body:{label:'patched'},headers:{Prefer:'return=representation'}}),'postgrest');
     assert.equal(r.data.length,1);assert.equal(r.data[0].label,'patched');
     await ok(call('/api/ledger?label=eq.patched',{method:'DELETE',headers:{Prefer:'return=representation'}}),'postgrest');
     assert.equal(count('patched'),0);assert.equal(count('keep-me'),1);await release();await ok(active);
-});
-scenario('disabled fallback rejects, queue full and zero delay spill immediately',async()=>{
+},20000);
+test('disabled fallback rejects, queue full and zero delay spill immediately',async()=>{
     const active=await blocked('limits-active');
     const off=await call('/off/rpc/read').promise;assert.equal(off.status,504);assert.equal(off.data.code,'PGRST003');assert.equal(off.headers['x-spill-backend'],'native');
     for(const route of ['full','zero'])await ok(call('/'+route+'/rpc/read'),'postgrest');
     await release();await ok(active);
-});
-scenario('authentication failures, SQL failures and post-commit response failures never spill',async()=>{
+},20000);
+test('authentication failures, SQL failures and post-commit response failures never spill',async()=>{
     const before=events('pool-spill');const active=await blocked('auth-active');
     assert.equal((await call('/api/rpc/read',{bearer:token('owner-a','wrong')}).promise).status,401);
     await release();await ok(active);
@@ -206,16 +202,16 @@ scenario('authentication failures, SQL failures and post-commit response failure
     const timeout=await call('/timeout/rpc/write',{method:'POST',body:{label:'timed-out',delay:0.3}}).promise;
     assert.equal(timeout.status,504);await Bun.sleep(350);assert.equal(count('timed-out'),0);
     assert.equal(events('pool-spill'),before);
-});
-scenario('missing target, reentry and unavailable PostgREST fail once without SQL replay',async()=>{
+},20000);
+test('missing target, reentry and unavailable PostgREST fail once without SQL replay',async()=>{
     const active=await blocked('errors-active');
     for(const [route,status] of [['missing',500],['loop',504],['down',502]]){
         const n=events('pool-spill'),r=await call('/'+route+'/rpc/write',{method:'POST',body:{label:route}}).promise;
         assert.equal(r.status,status,JSON.stringify(r));assert.equal(events('pool-spill'),n+1);assert.equal(count(route),0);
     }
     await release();await ok(active);
-});
-scenario('PostgREST acquisition timeout is returned with no retry',async()=>{
+},20000);
+test('PostgREST acquisition timeout is returned with no retry',async()=>{
     const active=await blocked('backup-full-active');
     // Hold the backup slot until its acquisition error arrives, independent of
     // Docker polling latency. Both occupants wait on the same advisory lock.
@@ -227,35 +223,35 @@ scenario('PostgREST acquisition timeout is returned with no retry',async()=>{
     await release();await Promise.all([ok(busy,'postgrest'),ok(active,'native')]);
     assert.equal(events('pool-spill'),n+1,'rejected request spills once');
     assert.equal(count('backup-full-busy'),1);assert.equal(count('backup-rejected'),0,'rejected write never executes after release');
-});
-scenario('njs, SSI and auth subrequests complete through native named-location handoff',async()=>{
+},20000);
+test('njs, SSI and auth subrequests complete through native named-location handoff',async()=>{
     const active=await blocked('subrequests-active');
     const r=await ok(call('/njs',{method:'POST',body:{label:'subrequest'}}));assert.equal(r.data,'subrequest');assert.equal(count('subrequest'),1);
     const s=await ok(call('/ssi'));assert.match(s.data,/^before.*after$/);
     const a=await ok(call('/auth'));assert.equal(a.data,'authorized');
     await release();await ok(active);
-});
-scenario('client cancellation before expiry cannot spill or execute later',async()=>{
+},20000);
+test('client cancellation before expiry cannot spill or execute later',async()=>{
     const active=await blocked('cancel-active'), n=events('pool-spill'),cancelled=await queued('/api/rpc/write',{method:'POST',body:{label:'cancelled'}});
     const c=events('queue-cancel');cancelled.cancel();await cancelled.promise;await until(()=>events('queue-cancel')>c,'cancel unlinked');
     await Bun.sleep(250);assert.equal(events('pool-spill'),n);assert.equal(count('cancelled'),0);await release();await ok(active);
-});
-scenario('HTTP/2 reset cancels only its waiter while a sibling spills',async()=>{
+},20000);
+test('HTTP/2 reset cancels only its waiter while a sibling spills',async()=>{
     const active=await blocked('h2-active'),session=connect('http://127.0.0.1:'+port);
     try{
         const send=label=>{const s=session.request({':path':'/api/rpc/write',':method':'POST','content-type':'application/json',authorization:'Bearer '+token()});let status,body='';const promise=new Promise(done=>{s.on('response',h=>status=h[':status']);s.on('data',b=>body+=b);s.on('error',()=>{});s.on('close',()=>done({status,body}));});s.end(JSON.stringify({label}));return{s,promise};};
         const before=events('queue-enter'),cancel=send('h2-cancel');await until(()=>events('queue-enter')>before,'h2 waiter');cancel.s.close(constants.NGHTTP2_CANCEL);await cancel.promise;
         const survivor=send('h2-survivor'),r=await survivor.promise;assert.equal(r.status,200);assert.equal(count('h2-cancel'),0);assert.equal(count('h2-survivor'),1);
     }finally{session.destroy();await release();await ok(active);}
-});
-scenario('release versus spill deadline races execute each write exactly once',async()=>{
+},20000);
+test('release versus spill deadline races execute each write exactly once',async()=>{
     for(let i=0;i<20;i++){
         const active=await blocked('race-active-'+i),h=await queued('/race/rpc/write',{method:'POST',body:{label:'race-'+i}});
         await Bun.sleep(i%2?55:5);await release();await Promise.all([ok(active),ok(h)]);assert.equal(count('race-'+i),1);
     }
 },60000);
-scenario('graceful reload drains a pending spill and accepts the new worker',async()=>{
+test('graceful reload drains a pending spill and accepts the new worker',async()=>{
     const active=await blocked('reload-active'),h=await queued('/api/rpc/write',{method:'POST',body:{label:'reload-spill'}});
     nginz.kill('SIGHUP');await ok(h,'postgrest');await release();await ok(active);assert.equal(count('reload-spill'),1);await ok(call(),'native');
-});
+},20000);
 });

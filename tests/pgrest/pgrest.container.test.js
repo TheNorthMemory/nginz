@@ -1,8 +1,8 @@
 import { dockerCommand } from "../docker.js";
 import {postgresFixture,adminArgs,explainSkip} from './container-fixture.js';
 import {randomBytes} from 'node:crypto';
-import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
-import {tmpdir} from 'node:os';
+import {readFileSync,writeFileSync} from 'node:fs';
+import {createTempDir,cleanupTempDir} from './runtime.js';
 import {join} from 'node:path';
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
@@ -200,7 +200,7 @@ describe.skipIf(Boolean(fixture.skip))("pgrest module - real PostgreSQL integrat
     psqlDb(SETUP_SQL);
     psqlAdminDb(RESTRICTED_SQL);
 
-    configDir=mkdtempSync(join(tmpdir(),'nginz-pgrest-integration-'));
+    configDir=createTempDir('integration-config');
     const configPath=join(configDir,'nginx.conf');
     writeFileSync(configPath,readFileSync(`tests/${MODULE}/nginx.container.conf`,'utf8')
       .replaceAll('host=127.0.0.1 port=5432 dbname=nginz_test user=nginz_test password=nginz_test_pass',
@@ -209,11 +209,17 @@ describe.skipIf(Boolean(fixture.skip))("pgrest module - real PostgreSQL integrat
   }, 60000);
 
   afterAll(async () => {
-    await stopNginz();
-
-    try {if(databaseCreated)psqlAdmin(`DROP DATABASE ${PG_DB} WITH (FORCE);`);}
-    finally {if(roleCreated)psqlAdmin(`DROP USER ${PG_USER};`);if(configDir)rmSync(configDir,{recursive:true,force:true});}
-    cleanupRuntime(MODULE);
+    try { await stopNginz(); }
+    finally {
+      try {if(databaseCreated)psqlAdmin(`DROP DATABASE ${PG_DB} WITH (FORCE);`);}
+      finally {
+        try {if(roleCreated)psqlAdmin(`DROP USER ${PG_USER};`);}
+        finally {
+          try {cleanupTempDir(configDir);}
+          finally {cleanupRuntime(MODULE);}
+        }
+      }
+    }
   }, 30000);
 
   // =========================================================================

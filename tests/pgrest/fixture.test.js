@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {dataVolume,endpoints} from './container-fixture.js';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
-import {tmpdir} from 'node:os';
+import {mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {createTempDir} from './runtime.js';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 
@@ -33,7 +33,7 @@ test('invalid explicit endpoints cannot enter generated nginx configuration',()=
 });
 
 for(const available of [false,true])test(available?'missing container is an explicit optional-fixture skip':'missing Docker is an explicit optional-fixture skip',()=>{
-    const directory=mkdtempSync(join(tmpdir(),'pgrest-prerequisites-'));
+    const directory=createTempDir('prerequisites');
     try{
         mkdirSync(join(directory,'bin'));
         writeFileSync(join(directory,'bin/docker'),'#!/bin/sh\n'+(available?'if [ "$1" = info ]; then echo fixture; exit 0; fi\n':'')+'exit 1\n',{mode:0o700});
