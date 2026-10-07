@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { dockerCommand } from "../docker.js";
 
 // Host role is orchestration only (Bun + Docker). Build, nginz, nft, and curl all
 // run inside the container so host Zig/glibc/nftables do not affect results.
@@ -35,11 +36,11 @@ function run(command, options = {}) {
 }
 
 function docker(...args) {
-  return run(["sudo", "docker", ...args]);
+  return run([...dockerCommand(), ...args]);
 }
 
 function dockerStreaming(...args) {
-  return run(["sudo", "docker", ...args], { capture: false });
+  return run([...dockerCommand(), ...args], { capture: false });
 }
 
 function dockerExec(command) {
@@ -48,7 +49,7 @@ function dockerExec(command) {
 
 function imageHasZig() {
   const result = Bun.spawnSync(
-    ["sudo", "docker", "run", "--rm", IMAGE, "zig", "version"],
+    [...dockerCommand(), "run", "--rm", IMAGE, "zig", "version"],
     {
       stdout: "pipe",
       stderr: "pipe",
@@ -58,12 +59,12 @@ function imageHasZig() {
   );
   if (result.exitCode !== 0) return false;
   const out = result.stdout ? Buffer.from(result.stdout).toString() : "";
-  return out.includes("0.17.0");
+  return out.trim() === "0.17.0";
 }
 
 function ensureImage() {
   if (!process.env.NFTSET_DOCKER_REBUILD) {
-    const inspect = Bun.spawnSync(["sudo", "docker", "image", "inspect", IMAGE], {
+    const inspect = Bun.spawnSync([...dockerCommand(), "image", "inspect", IMAGE], {
       stdout: "ignore",
       stderr: "ignore",
       cwd: process.cwd(),

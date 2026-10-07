@@ -362,6 +362,8 @@ describe('XPay key rotation', () => {
         writeFileSync(join(dir, 'nginx.conf'), `daemon off; error_log logs/error.log notice;
             pid logs/nginx.pid; events { worker_connections 64; }
             http { access_log off; client_body_temp_path client_temp;
+                variables_hash_max_size 2048;
+                variables_hash_bucket_size 128;
                 proxy_temp_path proxy_temp; fastcgi_temp_path fastcgi_temp;
                 uwsgi_temp_path uwsgi_temp; scgi_temp_path scgi_temp;
                 wechatpay_allow_insecure_http on;

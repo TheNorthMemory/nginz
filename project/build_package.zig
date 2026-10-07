@@ -233,6 +233,11 @@ pub fn generateConfig(info: ModuleInfo, writer: anytype) !void {
         \\
     , .{ module_name, module_name, info.modules[0] });
 
+    try writer.print("LINK_DEPS=\"$LINK_DEPS $ngx_addon_dir/{s}_module.o", .{obj_base});
+    if (info.needs_cjson) try writer.writeAll(" $ngx_addon_dir/libcjson.a");
+    if (info.needs_libinjection) try writer.writeAll(" $ngx_addon_dir/liblibinjection.a");
+    try writer.writeAll("\"\n");
+
     // Check if using new-style module system
     try writer.writeAll(
         \\if test -n "$ngx_module_link"; then
@@ -458,6 +463,11 @@ fn generateConfigComptime(comptime info: ModuleInfo) []const u8 {
     else
         "";
 
+    // Library link arguments alone do not become nginx make dependencies.
+    const link_deps = "LINK_DEPS=\"$LINK_DEPS $ngx_addon_dir/" ++ obj_base ++ "_module.o" ++
+        (if (info.needs_cjson) " $ngx_addon_dir/libcjson.a" else "") ++
+        (if (info.needs_libinjection) " $ngx_addon_dir/liblibinjection.a" else "") ++ "\"\n";
+
     return "# nginz module: " ++ module_name ++ "\n" ++
         "# Auto-generated config for nginx's ./configure --add-module=\n" ++
         "#\n" ++
@@ -468,6 +478,7 @@ fn generateConfigComptime(comptime info: ModuleInfo) []const u8 {
         "\n" ++
         "ngx_addon_name=\"" ++ info.modules[0] ++ "\"\n" ++
         "\n" ++
+        link_deps ++
         "if test -n \"$ngx_module_link\"; then\n" ++
         genNewStyleDecls(info) ++
         cjson_new ++
@@ -487,7 +498,7 @@ fn generateConfigComptime(comptime info: ModuleInfo) []const u8 {
 pub fn createPackageSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     nginx: *std.Build.Module,
     cjson_lib: *std.Build.Step.Compile,
     libinjection_lib: *std.Build.Step.Compile,

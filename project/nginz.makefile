@@ -18,11 +18,14 @@ all: ./submodules/nginx/objs/nginz.c
 		--with-debug
 	cd submodules/njs && ./configure
 
-copy: ./submodules/nginx/src/core/nginx.c ./submodules/nginx/objs/ngx_modules.c
-	cp ./submodules/nginx/src/core/nginx.c ./submodules/nginx/objs/nginz.c
+copy: ./submodules/nginx/objs/nginz.c
 
-./submodules/nginx/objs/nginz.c: copy
-	patch --batch -N ./submodules/nginx/objs/nginz.c < project/nginz.patch || grep -Fq 'main_nginx(int argc, char *const *argv)' ./submodules/nginx/objs/nginz.c
+./submodules/nginx/objs/nginz.c: ./submodules/nginx/src/core/nginx.c ./submodules/nginx/objs/ngx_modules.c project/nginz.patch project/nginz.makefile
+	@set -e; tmp=$$(mktemp "$@.XXXXXX"); \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	cp -p "$<" "$$tmp"; \
+	patch --silent --batch -N "$$tmp" < project/nginz.patch; \
+	if ! cmp -s "$$tmp" "$@"; then mv "$$tmp" "$@"; fi
 
 clean:
 	rm -f ./submodules/nginx/objs/ngx_modules.c ./submodules/nginx/objs/nginz.c

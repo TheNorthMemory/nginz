@@ -5,7 +5,7 @@ const ArrayList = std.array_list.Managed;
 pub fn build_stream(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const stream = b.addLibrary(.{
         .name = "ngx_stream",
@@ -19,7 +19,7 @@ pub fn build_stream(
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    _ = try common.list(b.graph.io, "./submodules/nginx/src/stream", 0, &common.STREAM_BUILD_BUFFER, &files);
+    _ = try common.list(b, "./submodules/nginx/src/stream", 0, &common.STREAM_BUILD_BUFFER, &files);
 
     for (common.NGX_INCLUDE_PATH) |p| {
         stream.root_module.addIncludePath(b.path(p));

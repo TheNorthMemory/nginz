@@ -571,8 +571,9 @@ fn handle_inspect(r: [*c]ngx_http_request_t) ngx_int_t {
         @min(@as(usize, limit_count), @as(usize, retained))
     else
         @as(usize, retained);
+    // Typed snapshots need alignment; ngx_pnalloc is only suitable for bytes.
     const matched_buf_opt: ?[*c]WorkerEventEntry = if (max_matched > 0)
-        core.castPtr(WorkerEventEntry, core.ngx_pnalloc(r.*.pool, max_matched * @sizeOf(WorkerEventEntry)))
+        core.castPtr(WorkerEventEntry, core.ngx_palloc(r.*.pool, max_matched * @sizeOf(WorkerEventEntry)))
     else
         null;
     var matched_count: usize = 0;

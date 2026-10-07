@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { dockerCommand } from "../docker.js";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
 
 const MODULE = "redis";
@@ -31,7 +32,7 @@ function run(command) {
 }
 
 function ensureContainerRunning(name) {
-  const result = runResult(["sudo", "docker", "inspect", "--format", "{{.State.Running}}", name]);
+  const result = runResult([...dockerCommand(), "inspect", "--format", "{{.State.Running}}", name]);
   if (result.exitCode !== 0 || !result.stdout.trim().includes("true")) {
     throw new Error(`Container ${name} is not running. Start it before running container tests.`);
   }
@@ -47,7 +48,7 @@ function ensureHostPortOpen(host, port) {
 // Run redis-cli inside the container
 function redisCli(...args) {
   const result = Bun.spawnSync(
-    ["sudo", "docker", "exec", "-i", REDIS_CONTAINER, "redis-cli", ...args],
+    [...dockerCommand(), "exec", "-i", REDIS_CONTAINER, "redis-cli", ...args],
     { stdout: "pipe", stderr: "pipe" }
   );
   const stdout = result.stdout ? Buffer.from(result.stdout).toString().trim() : "";

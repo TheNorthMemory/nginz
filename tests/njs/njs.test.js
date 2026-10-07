@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { createHash, createHmac } from "crypto";
+import { readFileSync, writeFileSync, unlinkSync } from "fs";
 import {
   startNginz,
   stopNginz,
@@ -163,5 +164,35 @@ describe("njs (QuickJS) module", () => {
       expect(res.status).toBe(200);
       expect(await res.text()).toBe("café");
     });
+  });
+});
+
+// Exercise the original njs engine too: its nginx addons must not also be
+// registered through the standalone CLI module table.
+describe("njs engine startup", () => {
+  const configPath = "tests/njs/.nginx-njs-engine.conf";
+
+  beforeAll(async () => {
+    const config = readFileSync("tests/njs/nginx.conf", "utf8")
+      .replace("js_engine qjs;", "js_engine njs;");
+    writeFileSync(configPath, config);
+    await startNginz(configPath, MODULE);
+  });
+
+  afterAll(async () => {
+    try {
+      await teardownModule(MODULE);
+    } finally {
+      try { unlinkSync(configPath); } catch {}
+    }
+  });
+
+  test("serves JavaScript content and initializes crypto once", async () => {
+    const hello = await testFetch("/hello");
+    expect(hello.status).toBe(200);
+    expect(await hello.text()).toBe("Hello from njs!\n");
+    const hash = await testFetch("/sha256?input=hello");
+    expect(hash.status).toBe(200);
+    expect(await hash.text()).toBe(createHash("sha256").update("hello").digest("hex"));
   });
 });

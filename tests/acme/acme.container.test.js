@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { dockerCommand } from "../docker.js";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import {
@@ -52,18 +53,18 @@ function run(command, options = {}) {
 }
 
 function docker(...args) {
-  return run(["sudo", "docker", ...args]);
+  return run([...dockerCommand(), ...args]);
 }
 
 function ensureDockerAvailable() {
-  const result = runResult(["sudo", "docker", "info"]);
+  const result = runResult([...dockerCommand(), "info"]);
   if (result.exitCode !== 0) {
     throw new Error(`Docker is required for ACME live tests but is not available.\n${result.stdout}${result.stderr}`.trim());
   }
 }
 
 function ensureDockerImageAvailable(image) {
-  const result = runResult(["sudo", "docker", "image", "inspect", image]);
+  const result = runResult([...dockerCommand(), "image", "inspect", image]);
   if (result.exitCode !== 0) {
     throw new Error(
       `Required Docker image is not available locally: ${image}\nPull it first, then rerun the test.\n${result.stdout}${result.stderr}`.trim()
@@ -73,14 +74,13 @@ function ensureDockerImageAvailable(image) {
 
 function containerDiagnostics(name) {
   const inspect = runResult([
-    "sudo",
-    "docker",
+    ...dockerCommand(),
     "inspect",
     "--format",
     "Running={{.State.Running}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}",
     name,
   ]);
-  const logs = runResult(["sudo", "docker", "logs", "--tail", "80", name]);
+  const logs = runResult([...dockerCommand(), "logs", "--tail", "80", name]);
   return [
     `inspect: ${inspect.stdout}${inspect.stderr}`.trim(),
     `logs:\n${logs.stdout}${logs.stderr}`.trim(),
@@ -88,7 +88,7 @@ function containerDiagnostics(name) {
 }
 
 function assertContainerRunning(name) {
-  const result = runResult(["sudo", "docker", "inspect", "--format", "{{.State.Running}}", name]);
+  const result = runResult([...dockerCommand(), "inspect", "--format", "{{.State.Running}}", name]);
   if (result.exitCode !== 0) {
     throw new Error(`Container ${name} is not inspectable.\n${result.stdout}${result.stderr}`.trim());
   }
@@ -101,9 +101,9 @@ function assertContainerRunning(name) {
 // can be rebound. No --rm on run: crashed containers stay inspectable.
 function stopAllAcmeContainers() {
   for (const name of [PEBBLE_CONTAINER, CHALLTESTSRV_CONTAINER]) {
-    runResult(["sudo", "docker", "rm", "-f", name]);
+    runResult([...dockerCommand(), "rm", "-f", name]);
   }
-  // Shared helper also tries sudo -n / plain docker when sudo prompts.
+  // Shared helper removes legacy timestamped containers too.
   stopAcmeDockerContainers();
 }
 
@@ -161,8 +161,7 @@ function startPebble() {
   const deadline = Date.now() + 2000;
   while (Date.now() < deadline) {
     const running = runResult([
-      "sudo",
-      "docker",
+      ...dockerCommand(),
       "inspect",
       "--format",
       "{{.State.Running}}",
@@ -182,7 +181,7 @@ function startPebble() {
 
 function stopContainer(name) {
   try {
-    runResult(["sudo", "docker", "rm", "-f", name]);
+    runResult([...dockerCommand(), "rm", "-f", name]);
   } catch {
     // best-effort
   }
@@ -225,8 +224,7 @@ async function waitForPebbleReady(timeout = 15000) {
   let lastCurl = "";
   while (Date.now() - start < timeout) {
     const running = runResult([
-      "sudo",
-      "docker",
+      ...dockerCommand(),
       "inspect",
       "--format",
       "{{.State.Running}}",

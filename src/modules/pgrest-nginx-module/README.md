@@ -1452,10 +1452,10 @@ causing SIGSEGV in posted-event logging under connection churn. The regression
 closes every HTTP connection while reusing PostgreSQL sockets. Reproduce with:
 
 ```sh
-MALLOC_PERTURB_=165 GLIBC_TUNABLES=glibc.malloc.tcache_count=0 ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest/pgrest.test.js
+MALLOC_PERTURB_=165 GLIBC_TUNABLES=glibc.malloc.tcache_count=0 ZIG_OPTIMIZE=ReleaseSafe bun test tests/pgrest/pgrest.test.js
 ```
 
-For an inspectable binary, `zig build -Doptimize=ReleaseSmall -Dstrip=false`
+For an inspectable binary, `zig build -Doptimize=ReleaseSafe -Dstrip=false`
 retains symbols. The default strip behavior is unchanged. The module-owned
 real-database and queue regressions run through `bun test tests/pgrest`.
 
@@ -1477,7 +1477,7 @@ This changes the previous sanitized error contract: review before image rollout.
 ### Scalar JSON response regression tests
 
 ```sh
-ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest
+ZIG_OPTIMIZE=ReleaseSafe bun test tests/pgrest
 ```
 
 The scalar suites cover JSON and JSONB, exact byte bounds and one-byte-over
@@ -1504,7 +1504,7 @@ large response must not assume that one write sends the whole frame. The shared
 transport regressions force partial writes, zero writes, and closed sockets:
 
 ```sh
-ZIG_OPTIMIZE=ReleaseSmall bun test tests/mocks/postgres.test.js
+ZIG_OPTIMIZE=ReleaseSafe bun test tests/mocks/postgres.test.js
 ```
 
 ### Real-container acquisition queue regression
@@ -1805,7 +1805,7 @@ The current pgrest module already has the right broad shape for strong simple-qu
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S0/S1 CORE FIXED; S2 POOL ENVELOPE MEASURED.** Per-worker pools are isolated by backend and have explicit lifecycle/capacity behavior. pgrest serializes directly into its nginx output buffer and rejects representations above its bound. The pool remains 16 connections by default but can be configured up to 32. A ReleaseSmall small-page matrix showed that 32 removes concurrency-32 pool-exhaustion 503s (200/200 correct), while peak throughput remained at concurrency 8; larger pools are therefore an explicit deployment tuning choice, not a new default. The 124-case focused suite is green.
+**Verdict: S0/S1 CORE FIXED; S2 POOL ENVELOPE MEASURED.** Per-worker pools are isolated by backend and have explicit lifecycle/capacity behavior. pgrest serializes directly into its nginx output buffer and rejects representations above its bound. The pool remains 16 connections by default but can be configured up to 32. A ReleaseSafe small-page matrix showed that 32 removes concurrency-32 pool-exhaustion 503s (200/200 correct), while peak throughput remained at concurrency 8; larger pools are therefore an explicit deployment tuning choice, not a new default. The 124-case focused suite is green.
 
 ### Bounded acquisition queue study (2026-10-05; historical proposal)
 

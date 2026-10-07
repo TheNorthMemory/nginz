@@ -45,17 +45,6 @@ const EXCLUDES = [_][]const u8{
     "ngx_http_degradation_module.c",
 };
 
-// ReleaseSafe runs full LLVM optimisation (-O2 + safety checks) which can OOM/SEGV
-// on large translation units (C blobs or combined Zig module bundles). Cap it to
-// ReleaseSmall (-Os + safety checks) which is far cheaper for LLVM while retaining
-// all runtime safety invariants.
-pub fn cap_optimize(opt: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
-    return if (opt == .safe) .small else opt;
-}
-
-// Kept as an alias so existing callers don't need to be touched.
-pub const c_optimize = cap_optimize;
-
 const bundled_nginx_header = @embedFile("../submodules/nginx/src/core/nginx.h");
 
 pub fn bundled_nginx_version() u32 {
@@ -89,7 +78,10 @@ pub fn append(files: *ArrayList([]const u8), src: []const []const u8) !void {
     }
 }
 
-pub fn list(io: Io, d: []const u8, ii: usize, mem: []u8, files: *ArrayList([]const u8)) !usize {
+pub fn list(b: *std.Build, d: []const u8, ii: usize, mem: []u8, files: *ArrayList([]const u8)) !usize {
+    // Directory entries determine the serialized C source list in Zig 0.17.
+    b.dependOnDirectoryContents(b.path(d));
+    const io = b.graph.io;
     var dir = Io.Dir.cwd().openDir(io, d, .{ .iterate = true }) catch {
         return ii;
     };
@@ -126,7 +118,7 @@ pub fn list(io: Io, d: []const u8, ii: usize, mem: []u8, files: *ArrayList([]con
                 i += len;
             }
             if (entry.kind == .directory) {
-                i = try list(io, mem[i .. i + len], i + len, mem, files);
+                i = try list(b, mem[i .. i + len], i + len, mem, files);
             }
         } else {
             break;

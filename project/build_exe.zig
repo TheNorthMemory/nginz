@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build_exe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const nginz = b.addExecutable(.{
         .name = "nginz",

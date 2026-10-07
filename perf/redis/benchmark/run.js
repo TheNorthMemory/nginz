@@ -118,8 +118,8 @@ async function main() {
   const concurrencies = options.concurrency;
 
   ensureBuild();
-  console.log("Building nginz with -Doptimize=ReleaseSmall...");
-  run(["zig", "build", "-Doptimize=ReleaseSmall"]);
+  console.log("Building nginz with -Doptimize=ReleaseSafe...");
+  run(["zig", "build", "-Doptimize=ReleaseSafe"]);
   console.log("Build successful");
 
   redisMock = createRedisMock(REDIS_PORT);
@@ -129,7 +129,7 @@ async function main() {
   redisMock.setValue("bench/large", "y".repeat(10240));
   redisMock.setValue("static-value", smallVal);
 
-  const optimizeMode = "ReleaseSmall";
+  const optimizeMode = "ReleaseSafe";
   activeArtifacts = createRunArtifacts(OUTPUT_DIR, MODULE, optimizeMode, options.artifactTag);
   activeRuntime.nginzPort = await getFreePort();
   activeRuntime.dir = activeArtifacts.runtimeDir;

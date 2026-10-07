@@ -5,10 +5,10 @@ import { join, isAbsolute } from "path";
 let nginzProcess = null;
 const NGINZ_BIN = "./zig-out/bin/nginz";
 const TEST_PORT = 8888;
-export const DEFAULT_PERF_OPTIMIZE = "ReleaseSmall";
+export const DEFAULT_PERF_OPTIMIZE = "ReleaseSafe";
 const BUILD_LOCK_PATH = join(process.cwd(), ".zig-build.lock");
 
-// Directory containing the `zig` executable used to build nginz. Set ZIG to a
+// Executable used to build nginz. Set ZIG to a
 // full path when the toolchain on PATH is not the required version, e.g.
 //   ZIG=/opt/zig-0.17.0/zig bun test tests/pgrest
 const ZIG = process.env.ZIG || "zig";
@@ -16,9 +16,13 @@ const ZIG = process.env.ZIG || "zig";
 const REQUIRED_ZIG_VERSION = "0.17.0";
 
 function zigVersion(zig) {
-  const result = spawnSync([zig, "version"], { stdout: "pipe", stderr: "pipe" });
-  if (result.exitCode !== 0) return null;
-  return result.stdout ? Buffer.from(result.stdout).toString().trim() : null;
+  try {
+    const result = spawnSync([zig, "version"], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode !== 0) return null;
+    return result.stdout ? Buffer.from(result.stdout).toString().trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 // Ports nginx itself binds in test configs (not Bun mock servers). Freeing
@@ -45,9 +49,9 @@ function acquireBuildLock(timeoutMs = 120000) {
 }
 
 // Build nginz before running tests
-// For performance-oriented runs, prefer ZIG_OPTIMIZE=ReleaseSmall.
-// ReleaseSmall is the project-recommended release-grade mode: it keeps safety
-// checks on and avoids the ReleaseSafe LLVM/memory issues documented in the repo.
+// For performance-oriented runs, prefer ZIG_OPTIMIZE=ReleaseSafe.
+// ReleaseSafe is the recommended optimized mode for Zig 0.17. The build
+// preserves the requested mode for both Zig modules and C libraries.
 export function ensureBuild() {
   const version = zigVersion(ZIG);
   if (version !== REQUIRED_ZIG_VERSION) {
@@ -209,7 +213,10 @@ function killListenersOnPort(port) {
       if (pid > 0 && pid !== process.pid) {
         try {
           process.kill(pid, "SIGKILL");
-        } catch {}
+          continue;
+        } catch (error) {
+          if (error?.code !== "EPERM") continue;
+        }
         // Root-owned host-network docker may require elevated kill; -n avoids
         // hanging on a password prompt when sudo is not passwordless.
         try {
@@ -252,8 +259,8 @@ function tryBindPort(port) {
 // and trips the bun hook timeout. Prefer passwordless `sudo -n` or bare docker.
 export function stopAcmeDockerContainers() {
   const dockerBins = [
-    ["sudo", "-n", "docker"],
     ["docker"],
+    ["sudo", "-n", "docker"],
   ];
   for (const docker of dockerBins) {
     try {

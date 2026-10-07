@@ -174,8 +174,8 @@ This is the default measurement loop for any module.
 2. **Choose the build mode deliberately**
    - record whether you used the default debug build or an optimized build
    - when using an optimized build, record the exact `ZIG_OPTIMIZE` value
-   - for perf runs in this repo, the default standard is **`ReleaseSmall`**
-   - `ReleaseSmall` is preferred over `ReleaseFast` as the baseline perf mode because it is already the repo-recommended release-grade build and keeps safety checks on
+   - for perf runs in this repo, the default standard is **`ReleaseSafe`**
+   - `ReleaseSafe` is preferred over `ReleaseFast` as the baseline perf mode because it is already the repo-recommended release-grade build and keeps safety checks on
 
 3. **Prepare dependencies and fixtures**
    - start required containers or external services
@@ -347,7 +347,7 @@ Use this checklist:
 - many existing nginx configs use `error_log logs/error.log debug;` and `access_log logs/access.log;`, which is useful for local diagnosis and should be preserved when it helps explain anomalies
 - `KEEP_LOGS=1` is useful when you need to preserve runtime artifacts for debugging
 - `ZIG_OPTIMIZE` should always be recorded in perf notes because it materially changes the run
-- perf runners should default to `ZIG_OPTIMIZE=ReleaseSmall` unless the benchmark is explicitly studying a different optimization mode
+- perf runners should default to `ZIG_OPTIMIZE=ReleaseSafe` unless the benchmark is explicitly studying a different optimization mode
 - the Prometheus module is the current in-repo standard for production metrics collection when a benchmark wants nginx-native counters and histograms
 
 ## Maintenance expectation

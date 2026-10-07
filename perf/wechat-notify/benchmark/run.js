@@ -59,7 +59,7 @@ export async function runComparison(overrides = {}) {
         if (!Number.isSafeInteger(value) || value < 1) throw new Error('benchmark counts must be positive integers');
     }
     if (options.sizes.some(size => size < 64 || size > 32768)) throw new Error('plaintext size must be between 64 and 32768 bytes');
-    const optimizeMode = process.env.ZIG_OPTIMIZE || 'ReleaseSmall';
+    const optimizeMode = process.env.ZIG_OPTIMIZE || 'ReleaseSafe';
     const artifacts = createRunArtifacts(resolve('perf', MODULE, 'benchmark', 'output'), MODULE, optimizeMode, options.artifactTag);
     const results = [], comparisons = [];
     let running = false;

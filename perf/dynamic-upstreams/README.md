@@ -62,7 +62,7 @@ bun perf/dynamic-upstreams/benchmark/run.js --scenario=sticky-read-with-churn --
 bun perf/dynamic-upstreams/benchmark/run.js --scenario=capture-and-purge --requests=500 --concurrency=8
 ```
 
-Default perf build mode is `ReleaseSmall`.
+Default perf build mode is `ReleaseSafe`.
 
 ## Notes
 

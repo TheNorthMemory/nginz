@@ -9,6 +9,12 @@ const NJS_C_FLAGS = [_][]const u8{
     "-Wextra",
     "-Wno-unused-parameter",
     "-Wno-cast-function-type-mismatch",
+    // nginx supplies typed pool callbacks to njs's generic chain/hash APIs.
+    "-fno-sanitize=function",
+    // njs casts a nonnumeric key's NaN index before testing whether it is
+    // representable (njs_atom_atomize_key). Keep ReleaseSafe, but exclude
+    // this C conversion check for the upstream JS engine.
+    "-fno-sanitize=float-cast-overflow",
     "-Wwrite-strings",
     "-Wmissing-prototypes",
     "-fexcess-precision=standard",
@@ -24,8 +30,10 @@ const NJS_INCLUDE_PATH = [_][]const u8{
 };
 
 const modules_files = .{
-    "submodules/njs/build/njs_modules.c",
-    "submodules/njs/build/qjs_modules.c",
+    // nginx registers crypto/XML/zlib through its engine addons. The njs
+    // CLI configure output registers them too, which breaks njs VM startup.
+    "project/njs_modules.c",
+    "project/qjs_modules.c",
 };
 
 const http_module_files = .{
@@ -43,7 +51,7 @@ const http_module_files = .{
 pub fn build_njs(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     quickjs: *std.Build.Step.Compile,
 ) !*std.Build.Step.Compile {
     const njs = b.addLibrary(.{
@@ -51,15 +59,15 @@ pub fn build_njs(
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    const n = try common.list(b.graph.io, "./submodules/njs/src", 0, &common.BUILD_BUFFER, &files);
-    _ = try common.list(b.graph.io, "./submodules/njs/external", n, &common.BUILD_BUFFER, &files);
+    const n = try common.list(b, "./submodules/njs/src", 0, &common.BUILD_BUFFER, &files);
+    _ = try common.list(b, "./submodules/njs/external", n, &common.BUILD_BUFFER, &files);
 
     try common.append(&files, &modules_files);
 
@@ -83,7 +91,7 @@ pub fn build_njs(
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });
@@ -101,7 +109,8 @@ pub fn build_njs(
 
     http_njs.root_module.addCSourceFiles(.{
         .files = &http_module_files,
-        .flags = &common.C_FLAGS,
+        // CLI configure names this feature LIBXML2; nginx uses XML for addons.
+        .flags = &(common.C_FLAGS ++ .{"-DNJS_HAVE_XML=1"}),
     });
     const install_object = b.addInstallFile(http_njs.getEmittedBin(), "ngx_http_js_module.o");
     b.getInstallStep().dependOn(&install_object.step);

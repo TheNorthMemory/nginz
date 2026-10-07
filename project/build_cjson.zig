@@ -42,14 +42,14 @@ const files = [_][]const u8{
 pub fn build_cjson(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Step.Compile {
     const cjson = b.addLibrary(.{
         .name = "cjson",
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });

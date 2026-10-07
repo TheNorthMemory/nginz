@@ -9,7 +9,7 @@ const CHECK_C_FLAGS = common.C_FLAGS ++ [_][]const u8{
 pub fn addCheckLayoutSteps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     nginx: *std.Build.Module,
     patch_step: *std.Build.Step,
 ) *std.Build.Step {
@@ -56,7 +56,7 @@ pub fn addCheckLayoutSteps(
 
     // Step 4: Run the Zig comparator with the C output file as argument
     const run_zig = b.addRunArtifact(zig_checker);
-    run_zig.addFileArg(c_output);
+    run_zig.addFileArg2(c_output, .{});
 
     return &run_zig.step;
 }

@@ -1,7 +1,7 @@
 ## Nginz
 
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
-is based on official nginx release 1.30.5 and zig 0.17. nginz is tested with linux only.
+is based on official nginx release 1.30.5 and requires Zig 0.17.0 exactly. nginz is tested with linux only.
 
 A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs) provides the scripted
 Gleam/njs composition layer on top of the native primitives exposed here. It currently ships
@@ -21,28 +21,39 @@ $ zig build test
 $ bun test
 ```
 
+If the default `zig` is a different version, select the test toolchain with
+`ZIG=/path/to/zig-x86_64-linux-0.17.0/zig bun test`.
+
 ### Build strategy
 
-The build has three tiers optimised for different goals:
+Use Debug for development and ReleaseSafe for optimized builds with Zig 0.17.0:
 
 | Command | Use case | Notes |
 |---------|----------|-------|
 | `zig build` | Development | Debug mode, fastest compile, safety checks on |
-| `zig build -Doptimize=ReleaseSmall` | Release | Recommended — safety checks on, compact binary, LLVM-friendly |
-| `zig build -Doptimize=ReleaseSafe` | **Avoid** | Safety checks on but full `-O2` — see below |
+| `zig build -Doptimize=ReleaseSafe` | Release | Recommended optimized build with safety checks on |
 
-> [!WARNING]
-> **`-Doptimize=ReleaseSafe` will segfault on some developer machines.** The build combines all
-> modules into a single LLVM compilation unit, and ReleaseSafe's `-O2` pass over that unit
-> exceeds 16 GB peak memory even with `-j1`. `ReleaseSmall` uses `-Os` and compiles successfully;
-> it preserves all runtime safety checks and produces a comparably sized binary. Use it instead.
+The build preserves the selected optimization mode for all Zig modules and C
+libraries. The Zig 0.16 workaround that downgraded ReleaseSafe to ReleaseSmall
+has been removed.
+
+QuickJS uses typed allocator callbacks through its generic DynBuf interface.
+Its C build disables only the function-signature sanitizer for those casts;
+njs disables the same callback check for nginx pool callbacks and the C
+float-to-integer conversion check for its key-index
+fast path, which casts nonnumeric keys before checking their range. ReleaseSafe
+and the remaining C/Zig safety checks stay enabled. The QuickJS startup, HTTP,
+standard-library, and subrequest paths are covered by `tests/njs/`.
 
 Nginx development requires some system library dependencies, which shall be addressed first.
 A Dockerfile is provided as reference so that one can build their own dev image.
 
 ### Container Tests
 
-Four modules rely on running containers for some of their integration tests. All container interaction uses `sudo docker`.
+Four modules rely on running containers for some of their integration tests. Tests
+use the current user's Docker access and fall back to `sudo -n docker` only when
+needed. Password prompts are never required. The nftset container retains its
+network capabilities so it can manage its isolated nftables ruleset.
 
 **nftset** — Docker-isolated live nftables suite. Provisions temporary tables/sets inside a
 disposable container namespace so the host nftables ruleset is never touched.
@@ -56,14 +67,14 @@ disposable container namespace so the host nftables ruleset is never touched.
 and drop a dedicated database on each run, so no manual setup is needed beyond starting the container:
 
 ```bash
-sudo docker run -d --name pgrest-nginz-test -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.1-trixie
+docker run -d --name pgrest-nginz-test -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.1-trixie
 ```
 
 **redis** — Requires a running Redis container named `redis-nginz-test`. Tests run against a
 real Redis instance, flushing all keys before each suite:
 
 ```bash
-sudo docker run -d --name redis-nginz-test -p 6379:6379 redis:8.6.2-trixie
+docker run -d --name redis-nginz-test -p 6379:6379 redis:8.6.2-trixie
 ```
 
 > [!NOTE]

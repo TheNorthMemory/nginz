@@ -561,7 +561,7 @@ fn fetchUrlBody(pool: [*c]ngx_pool_t, url: []const u8) ?[]u8 {
     }
     defer _ = close(fd);
 
-    const request = std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", .{ path_slice, host_slice }) catch return null;
+    const request = allocator.print("GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", .{ path_slice, host_slice }) catch return null;
     defer allocator.free(request);
 
     if (parsed_host.ssl) return fetchHttpsBody(pool, fd, host_slice, request);

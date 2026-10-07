@@ -54,21 +54,21 @@ const event_files = .{
 pub fn build_core(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const core = b.addLibrary(.{
         .name = "ngx_core",
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    _ = try common.list(b.graph.io, "./submodules/nginx/src/core", 0, &common.BUILD_BUFFER, &files);
+    _ = try common.list(b, "./submodules/nginx/src/core", 0, &common.BUILD_BUFFER, &files);
 
     try common.append(&files, &lib_files);
     try common.append(&files, &os_files);

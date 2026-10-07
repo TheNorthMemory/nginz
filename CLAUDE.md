@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.5 and requires Zig 0.17. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
+Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.5 and requires Zig 0.17.0 exactly. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
 
 ## Zig standard library restrictions
 
@@ -158,20 +158,20 @@ bun test tests/jsonschema/
 Test environment variables:
 - `ZIG=/path/to/zig-0.17.0/zig` - Build toolchain. Set this when the `zig` on `PATH` is not 0.17.0; the harness verifies the version and refuses to build with a mismatched toolchain.
 - `KEEP_LOGS=1` - Preserve runtime directory and nginx logs for debugging
-- `ZIG_OPTIMIZE=ReleaseSmall` - Build with optimizations (faster tests). `ReleaseFast` and `ReleaseSafe` are also accepted; `ReleaseSafe` is capped to `ReleaseSmall` by the build.
+- `ZIG_OPTIMIZE=ReleaseSafe` - Build with optimizations (faster tests). The build preserves the requested mode for all Zig modules and C libraries.
 
 ```bash
 # Debug build with logs preserved
 KEEP_LOGS=1 bun test tests/oidc/
 
 # Release build for faster test runs
-ZIG_OPTIMIZE=ReleaseSmall bun test
+ZIG_OPTIMIZE=ReleaseSafe bun test
 
 # Select the required toolchain when the default `zig` differs
-ZIG=/opt/zig-x86_64-linux-0.17.0/zig ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest
+ZIG=/opt/zig-x86_64-linux-0.17.0/zig ZIG_OPTIMIZE=ReleaseSafe bun test tests/pgrest
 
 # Both combined
-KEEP_LOGS=1 ZIG_OPTIMIZE=ReleaseSmall bun test tests/acme/
+KEEP_LOGS=1 ZIG_OPTIMIZE=ReleaseSafe bun test tests/acme/
 ```
 
 Test nginx.conf files should use `error_log logs/error.log debug;` for debugging.

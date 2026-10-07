@@ -6,21 +6,21 @@ const ArrayList = std.array_list.Managed;
 pub fn build_modules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const modules = b.addLibrary(.{
         .name = "ngx_modules",
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    _ = try common.list(b.graph.io, "submodules/nginx/src/http/modules", 0, &common.BUILD_BUFFER, &files);
+    _ = try common.list(b, "submodules/nginx/src/http/modules", 0, &common.BUILD_BUFFER, &files);
 
     for (common.NGX_INCLUDE_PATH) |p| {
         modules.root_module.addIncludePath(b.path(p));
@@ -39,21 +39,21 @@ pub fn build_modules(
 pub fn build_test_modules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const modules = b.addLibrary(.{
         .name = "ngx_test_modules",
         .root_module = b.createModule(.{
             .pic = true,
             .target = target,
-            .optimize = common.c_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    _ = try common.list(b.graph.io, "submodules/nginx/src/http/modules", 0, &common.BUILD_BUFFER, &files);
+    _ = try common.list(b, "submodules/nginx/src/http/modules", 0, &common.BUILD_BUFFER, &files);
     try files.append("submodules/nginx/objs/ngx_modules.c");
 
     for (common.NGX_INCLUDE_PATH) |p| {

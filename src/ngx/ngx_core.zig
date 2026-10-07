@@ -334,7 +334,9 @@ pub const IpAddress = union(enum) {
 
     pub fn inCidr(self: IpAddress, cidr: ngx_cidr_t) bool {
         return switch (self) {
-            .ip4 => |bytes| cidr.family == std.posix.AF.INET and (@as(u32, @bitCast(bytes)) & cidr.u.in.mask) == cidr.u.in.addr,
+            // nginx stores network bytes in native u32 memory. Zig 0.17's array
+            // bitCast is endian-independent and cannot model that on big endian.
+            .ip4 => |bytes| cidr.family == std.posix.AF.INET and (std.mem.readInt(u32, &bytes, .native) & cidr.u.in.mask) == cidr.u.in.addr,
             .ip6 => |bytes| blk: {
                 if (cidr.family != std.posix.AF.INET6) break :blk false;
                 for (bytes, cidr.u.in6.mask.__in6_u.__u6_addr8, cidr.u.in6.addr.__in6_u.__u6_addr8) |byte, mask, addr| {

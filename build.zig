@@ -205,7 +205,7 @@ pub fn build(b: *std.Build) void {
             .pic = true,
             .root_source_file = b.path("src/ngz_zig_modules.zig"),
             .target = target,
-            .optimize = common.cap_optimize(optimize),
+            .optimize = optimize,
             .link_libc = true,
         }),
     });

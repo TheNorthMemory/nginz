@@ -237,7 +237,7 @@ async function main() {
   }
 
   const enabledServices = options.service === "both" ? ["pgrest", "postgrest"] : [options.service];
-  const optimizeMode = process.env.ZIG_OPTIMIZE || "ReleaseSmall";
+  const optimizeMode = process.env.ZIG_OPTIMIZE || "ReleaseSafe";
   let currentPhase = "setup";
   let currentScenario = null;
   let currentService = null;

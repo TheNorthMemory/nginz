@@ -5,7 +5,7 @@ const ArrayList = std.array_list.Managed;
 pub fn build_http(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) !*std.Build.Step.Compile {
     const http = b.addLibrary(.{
         .name = "ngx_http",
@@ -19,8 +19,8 @@ pub fn build_http(
 
     var files = ArrayList([]const u8).init(b.allocator);
     defer files.deinit();
-    const n = try common.list(b.graph.io, "./submodules/nginx/src/http", 0, &common.BUILD_BUFFER, &files);
-    _ = try common.list(b.graph.io, "./submodules/nginx/src/event/quic", n, &common.BUILD_BUFFER, &files);
+    const n = try common.list(b, "./submodules/nginx/src/http", 0, &common.BUILD_BUFFER, &files);
+    _ = try common.list(b, "./submodules/nginx/src/event/quic", n, &common.BUILD_BUFFER, &files);
 
     for (common.NGX_INCLUDE_PATH) |p| {
         http.root_module.addIncludePath(b.path(p));

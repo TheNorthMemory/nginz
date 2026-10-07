@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "bun";
 
 let nginzProcess = null;
 const NGINZ_BIN = "./zig-out/bin/nginz";
-export const DEFAULT_PERF_OPTIMIZE = "ReleaseSmall";
+export const DEFAULT_PERF_OPTIMIZE = "ReleaseSafe";
 
 export function ensureBuild() {
   const optimize = process.env.ZIG_OPTIMIZE || DEFAULT_PERF_OPTIMIZE;

@@ -350,7 +350,7 @@ async function main() {
 
   ensureBuild();
 
-  const optimizeMode = process.env.ZIG_OPTIMIZE || "ReleaseSmall";
+  const optimizeMode = process.env.ZIG_OPTIMIZE || "ReleaseSafe";
   activeArtifacts = createRunArtifacts(OUTPUT_DIR, MODULE, optimizeMode, options.artifactTag);
   writeManifest(activeArtifacts, { status: "initializing" });
 

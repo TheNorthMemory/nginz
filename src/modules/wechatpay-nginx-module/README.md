@@ -320,7 +320,7 @@ decimal. The gate imposes no age/replay window, allowing provider retries with
 the same signed envelope. The application remains responsible for idempotent
 business processing and acknowledging only completed work.
 
-Validation: `ZIG_OPTIMIZE=ReleaseSmall bun test tests/wechat-notify/ tests/wechatpay/ tests/xpay/`.
+Validation: `ZIG_OPTIMIZE=ReleaseSafe bun test tests/wechat-notify/ tests/wechatpay/ tests/xpay/`.
 The new suite covers JSON/XML, all padding lengths, application isolation,
 decryption failures, GET challenges, split/chunked/100-continue requests,
 file-backed bodies, native bounds, inherited disabling, subrequest rejection,
@@ -329,7 +329,7 @@ echo/njs/proxy consumers, and repeated synchronous echo requests on keepalive.
 The [native/njs comparison](../../../perf/wechat-notify/README.md) holds the njs
 content handler constant and reports throughput and latency across payload sizes
 and concurrency levels. Run the opt-in comparison test with
-`WECHAT_NOTIFY_BENCHMARK=1 ZIG_OPTIMIZE=ReleaseSmall bun test tests/wechat-notify/benchmark.test.js`.
+`WECHAT_NOTIFY_BENCHMARK=1 ZIG_OPTIMIZE=ReleaseSafe bun test tests/wechat-notify/benchmark.test.js`.
 
 ### Documentation Audit Checklist
 

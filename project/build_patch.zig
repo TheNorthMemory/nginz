@@ -4,20 +4,15 @@ const Step = std.Build.Step;
 
 /// Apply the nginz patch to the nginx C entry point.
 ///
-/// The historical `make` recipe unconditionally re-copies `nginx.c` over
-/// `nginz.c` and re-applies the patch, which changes `nginz.c`'s mtime even
-/// when its content is identical. Under Zig 0.17 the build runner treats that
-/// metadata change as a dirty C input and relinks the whole `nginz` binary on
-/// every invocation (several seconds), which is slow enough to trip the
-/// integration harness build lock/hook timeout. Guard the recipe so an
-/// already-patched `nginz.c` is left untouched and the compile stays cached.
+/// Let make track the source, patch, and configured headers. Its recipe only
+/// replaces nginz.c when the patched contents change, preserving cached builds
+/// without ignoring updated inputs or missing configuration files.
+/// Rewriting byte-identical C changes its mtime and triggers a roughly 5-second
+/// relink under Zig 0.17, which can exceed Bun's beforeAll hook timeout. Keep
+/// the Make recipes' compare-before-replace behavior when changing this step.
 pub fn patchStep(b: *Build, docker: bool) *Step {
     const makefile = if (docker) "project/nginz.docker.makefile" else "project/nginz.makefile";
-    const script = b.fmt(
-        "grep -qF 'main_nginx(int argc' submodules/nginx/objs/nginz.c 2>/dev/null || make -f {s}",
-        .{makefile},
-    );
-    const run = b.addSystemCommand(&[_][]const u8{ "sh", "-c", script });
+    const run = b.addSystemCommand(&.{ "make", "-f", makefile });
 
     // Preserve the historical `zig build patch` top-level step name.
     const named = b.step("patch", "patch nginz");

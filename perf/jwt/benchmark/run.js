@@ -157,13 +157,13 @@ async function main() {
   if (scenarios.length === 0) { console.error("No scenarios"); process.exit(1); }
   const concurrencies = options.concurrency;
 
-  // Build ReleaseSmall for perf, then restore debug build after.
+  // Build ReleaseSafe for perf, then restore debug build after.
   // This avoids polluting zig-out/ and breaking integration tests.
-  console.log("Building nginz with -Doptimize=ReleaseSmall...");
-  run(["zig", "build", "-Doptimize=ReleaseSmall"]);
+  console.log("Building nginz with -Doptimize=ReleaseSafe...");
+  run(["zig", "build", "-Doptimize=ReleaseSafe"]);
   console.log("Build successful");
 
-  const optimizeMode = "ReleaseSmall";
+  const optimizeMode = "ReleaseSafe";
   activeArtifacts = createRunArtifacts(OUTPUT_DIR, MODULE, optimizeMode, options.artifactTag);
   activeRuntime.nginzPort = await getFreePort();
   activeRuntime.dir = activeArtifacts.runtimeDir;

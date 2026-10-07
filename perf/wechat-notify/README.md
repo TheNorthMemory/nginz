@@ -3,8 +3,8 @@
 Run from the repository root:
 
 ```sh
-ZIG_OPTIMIZE=ReleaseSmall bun perf/wechat-notify/benchmark/run.js
-WECHAT_NOTIFY_BENCHMARK=1 ZIG_OPTIMIZE=ReleaseSmall bun test tests/wechat-notify/benchmark.test.js
+ZIG_OPTIMIZE=ReleaseSafe bun perf/wechat-notify/benchmark/run.js
+WECHAT_NOTIFY_BENCHMARK=1 ZIG_OPTIMIZE=ReleaseSafe bun test tests/wechat-notify/benchmark.test.js
 ```
 
 The runner uses the shared `perf/common` lifecycle, CLI, reporting, artifact and
