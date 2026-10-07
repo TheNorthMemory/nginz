@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxslt1-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Official Zig 0.16.0 tarball — self-contained, pinned for reproducible container builds.
-ARG ZIG_VERSION=0.16.0
+# Official Zig 0.17.0 tarball — self-contained, pinned for reproducible container builds.
+ARG ZIG_VERSION=0.17.0
 ARG ZIG_ARCH=x86_64
 RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt \

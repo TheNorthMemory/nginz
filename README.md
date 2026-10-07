@@ -1,7 +1,7 @@
 ## Nginz
 
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
-is based on official nginx release 1.30.5 and zig 0.16. nginz is tested with linux only.
+is based on official nginx release 1.30.5 and zig 0.17. nginz is tested with linux only.
 
 A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs) provides the scripted
 Gleam/njs composition layer on top of the native primitives exposed here. It currently ships

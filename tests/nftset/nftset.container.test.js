@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 
 // Host role is orchestration only (Bun + Docker). Build, nginz, nft, and curl all
 // run inside the container so host Zig/glibc/nftables do not affect results.
-const IMAGE = "nginz-nftset-test:zig-0.16.0";
+const IMAGE = "nginz-nftset-test:zig-0.17.0";
 const CONTAINER = `nginz-nftset-${Date.now()}`;
 // All build + runtime paths live on the container filesystem. The host tree is
 // mounted read-only at /src and copied to /workdir so patches/build never touch the host.
@@ -58,7 +58,7 @@ function imageHasZig() {
   );
   if (result.exitCode !== 0) return false;
   const out = result.stdout ? Buffer.from(result.stdout).toString() : "";
-  return out.includes("0.16.0");
+  return out.includes("0.17.0");
 }
 
 function ensureImage() {

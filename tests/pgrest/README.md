@@ -18,7 +18,7 @@ converted to a skip.
 
 ## Prerequisites
 
-- The normal nginz build dependencies, including Zig 0.16, Bun and libpq.
+- The normal nginz build dependencies, including Zig 0.17, Bun and libpq.
 - Optional Docker access (directly or through `sudo -n docker`) and a disposable
   PostgreSQL test container. The default name is `pgrest-nginz-test`; override it
   with `PGREST_TEST_CONTAINER`. Tests discover its port, published endpoints,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.5 and requires Zig 0.16. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
+Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.5 and requires Zig 0.17. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
 
 ## Zig standard library restrictions
 
@@ -17,7 +17,7 @@ These hard restrictions apply to nginx modules and their wrappers. Standalone Zi
 
 ## Skills
 - Read from $HOME/.claude/skills
-- This project requires zig 0.16, equip yourself with `skills/zig-0.16/SKILL.md`
+- This project requires zig 0.17, equip yourself with `skills/zig-0.17/SKILL.md`
 - Nginx is a subtle piece of software, it might take substantial effort to learn a hard fact when debug its core and native modules, as you learnt, append to an existing skill or create one
 - Bun integration test flakiness: see `skills/bun-test-flaky-connection/SKILL.md` before debugging "socket connection was closed unexpectedly" failures
 
