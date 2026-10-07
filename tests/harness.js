@@ -8,6 +8,19 @@ const TEST_PORT = 8888;
 export const DEFAULT_PERF_OPTIMIZE = "ReleaseSmall";
 const BUILD_LOCK_PATH = join(process.cwd(), ".zig-build.lock");
 
+// Directory containing the `zig` executable used to build nginz. Set ZIG to a
+// full path when the toolchain on PATH is not the required version, e.g.
+//   ZIG=/opt/zig-0.17.0/zig bun test tests/pgrest
+const ZIG = process.env.ZIG || "zig";
+// Keep in sync with required_zig_version in build.zig.
+const REQUIRED_ZIG_VERSION = "0.17.0";
+
+function zigVersion(zig) {
+  const result = spawnSync([zig, "version"], { stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) return null;
+  return result.stdout ? Buffer.from(result.stdout).toString().trim() : null;
+}
+
 // Ports nginx itself binds in test configs (not Bun mock servers). Freeing
 // mock ports (190xx / 16xxx) here would kill the test process that already
 // started createHTTPMock() in beforeAll.
@@ -36,9 +49,19 @@ function acquireBuildLock(timeoutMs = 120000) {
 // ReleaseSmall is the project-recommended release-grade mode: it keeps safety
 // checks on and avoids the ReleaseSafe LLVM/memory issues documented in the repo.
 export function ensureBuild() {
+  const version = zigVersion(ZIG);
+  if (version !== REQUIRED_ZIG_VERSION) {
+    throw new Error(
+      `nginz requires Zig ${REQUIRED_ZIG_VERSION}, but \`${ZIG}\` reports ${version ?? "an unknown version"}.\n` +
+        `Point the test harness at the required toolchain, e.g.\n` +
+        `  ZIG=/path/to/zig-x86_64-linux-${REQUIRED_ZIG_VERSION}/zig bun test <suite>\n` +
+        `or put that directory first on PATH.`,
+    );
+  }
+
   const lockFd = acquireBuildLock();
   const optimize = process.env.ZIG_OPTIMIZE;
-  const args = ["zig", "build"];
+  const args = [ZIG, "build"];
 
   try {
     if (optimize) {
