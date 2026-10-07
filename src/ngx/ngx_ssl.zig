@@ -749,9 +749,9 @@ test "OpenSSL SHA256 and multipart HMAC-SHA256 vectors" {
     try std.testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &std.fmt.bytesToHex(try sha256(""), .lower));
     try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", &std.fmt.bytesToHex(try sha256("abc"), .lower));
     // RFC 4231 cases 1 and 6 cover multipart input and keys longer than a block.
-    const key = [_]u8{0x0b} ** 20;
+    const key: [20]u8 = @splat(0x0b);
     try std.testing.expectEqualStrings("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", &std.fmt.bytesToHex(try hmacSha256(&key, &.{ "Hi", "", " There" }), .lower));
-    const long_key = [_]u8{0xaa} ** 131;
+    const long_key: [131]u8 = @splat(0xaa);
     try std.testing.expectEqualStrings("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", &std.fmt.bytesToHex(try hmacSha256(&long_key, &.{"Test Using Larger Than Block-Size Key - Hash Key First"}), .lower));
     try std.testing.expectEqualStrings("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad", &std.fmt.bytesToHex(try hmacSha256("", &.{}), .lower));
 }

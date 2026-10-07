@@ -479,8 +479,7 @@ export fn ngx_http_cache_tags_header_filter(r: [*c]ngx_http_request_t) callconv(
                 const complete = associateTagsWithUri(store, tags_value, uri);
                 shm.ngx_shmtx_unlock(&shpool.*.mutex);
                 if (!complete) {
-                    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-                        "cache_tags: tag/URI rejected due to bounds or shared-store capacity", .{});
+                    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0, "cache_tags: tag/URI rejected due to bounds or shared-store capacity", .{});
                 }
             }
         }
@@ -786,8 +785,8 @@ test "tag parsing" {
 
 test "oversized tag and URI are rejected without consuming slots" {
     var store = std.mem.zeroes(cache_tags_store);
-    var long_tag = [_]u8{'t'} ** (MAX_TAG_LEN + 1);
-    var long_uri = [_]u8{'u'} ** (MAX_URI_LEN + 1);
+    var long_tag: [MAX_TAG_LEN + 1]u8 = @splat('t');
+    var long_uri: [MAX_URI_LEN + 1]u8 = @splat('u');
     try std.testing.expect(!associateTagsWithUri(&store, &long_tag, "/ok"));
     try std.testing.expect(!associateTagsWithUri(&store, "ok", &long_uri));
     try expectEqual(@as(usize, 0), store.tag_count);

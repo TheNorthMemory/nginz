@@ -59,7 +59,7 @@ pub fn extract_jwt_token(r: [*c]ngx_http_request_t) ?[]const u8 {
 }
 
 const b64url_table: [256]u8 = blk: {
-    var t = [_]u8{0xFF} ** 256;
+    var t: [256]u8 = @splat(0xFF);
     const std_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     for (std_chars, 0..) |c, i| t[c] = @intCast(i);
     t['-'] = 62;

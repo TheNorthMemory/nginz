@@ -75,8 +75,8 @@ var ngx_http_circuit_breaker_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.n
 
 fn circuitStateFromByte(value: u8) CircuitState {
     return switch (value) {
-        @intFromEnum(CircuitState.open) => .open,
-        @intFromEnum(CircuitState.half_open) => .half_open,
+        @backingInt(CircuitState.open) => .open,
+        @backingInt(CircuitState.half_open) => .half_open,
         CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT => .half_open,
         else => .closed,
     };
@@ -162,7 +162,7 @@ fn findOrCreateCircuit(store: *circuit_store, key: []const u8) ?*SharedCircuitSt
             const copy_len = @min(key.len, MAX_CIRCUIT_KEY_LEN);
             @memcpy(entry.key[0..copy_len], key[0..copy_len]);
             entry.key_len = @intCast(copy_len);
-            entry.stats.state = @intFromEnum(CircuitState.closed);
+            entry.stats.state = @backingInt(CircuitState.closed);
             store.*.circuit_count += 1;
             return &entry.stats;
         }
@@ -196,7 +196,7 @@ fn checkTimeout(stats: *SharedCircuitStats, timeout_ms: ngx_uint_t) void {
     const elapsed = now - stats.last_state_change_ms;
 
     if (elapsed >= @as(i64, @intCast(timeout_ms))) {
-        stats.state = @intFromEnum(CircuitState.half_open);
+        stats.state = @backingInt(CircuitState.half_open);
         stats.success_count = 0;
         stats.failure_count = 0;
         stats.last_state_change_ms = now;
@@ -214,14 +214,14 @@ fn recordSuccess(stats: *SharedCircuitStats, success_threshold: ngx_uint_t) void
             stats.success_count += 1;
             if (stats.success_count >= success_threshold) {
                 // Enough successes, close the circuit
-                stats.state = @intFromEnum(CircuitState.closed);
+                stats.state = @backingInt(CircuitState.closed);
                 stats.failure_count = 0;
                 stats.success_count = 0;
                 stats.last_state_change_ms = getCurrentTimeMs();
             } else {
                 // The single half-open probe completed successfully; admit
                 // the next probe only after this outcome is recorded.
-                stats.state = @intFromEnum(CircuitState.half_open);
+                stats.state = @backingInt(CircuitState.half_open);
             }
         },
         .open => {
@@ -237,13 +237,13 @@ fn recordFailure(stats: *SharedCircuitStats, failure_threshold: ngx_uint_t) void
             stats.failure_count += 1;
             if (stats.failure_count >= failure_threshold) {
                 // Too many failures, open the circuit
-                stats.state = @intFromEnum(CircuitState.open);
+                stats.state = @backingInt(CircuitState.open);
                 stats.last_state_change_ms = getCurrentTimeMs();
             }
         },
         .half_open => {
             // Any failure in half-open immediately opens the circuit
-            stats.state = @intFromEnum(CircuitState.open);
+            stats.state = @backingInt(CircuitState.open);
             stats.failure_count = 0;
             stats.success_count = 0;
             stats.last_state_change_ms = getCurrentTimeMs();
@@ -356,7 +356,7 @@ fn ngx_http_circuit_breaker_log_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     // the transition and must not be mistaken for the recovery probe.
     if (ctx.*.is_half_open_probe == 1) {
         if (stats.*.state != CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT) return NGX_OK;
-        stats.*.state = @intFromEnum(CircuitState.half_open);
+        stats.*.state = @backingInt(CircuitState.half_open);
     } else if (circuitStateFromByte(stats.*.state) != .closed) {
         return NGX_OK;
     }

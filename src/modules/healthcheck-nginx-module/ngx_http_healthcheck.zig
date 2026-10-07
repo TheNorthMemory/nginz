@@ -289,12 +289,12 @@ var healthcheck_probe_port: u16 = 80;
 var healthcheck_probe_host_len: usize = 0;
 var healthcheck_probe_path_len: usize = 1;
 var healthcheck_probe_flags: u8 = 0; // PROBE_FLAG_TLS, PROBE_FLAG_HAS_MATCH
-var healthcheck_probe_host_buf: [MAX_PROBE_HOST_LEN]u8 = [_]u8{0} ** MAX_PROBE_HOST_LEN;
-var healthcheck_probe_path_buf: [MAX_PROBE_PATH_LEN]u8 = [_]u8{0} ** MAX_PROBE_PATH_LEN;
+var healthcheck_probe_host_buf: [MAX_PROBE_HOST_LEN]u8 = @splat(0);
+var healthcheck_probe_path_buf: [MAX_PROBE_PATH_LEN]u8 = @splat(0);
 var healthcheck_probe_match_status_min: ngx_uint_t = 0;
 var healthcheck_probe_match_status_max: ngx_uint_t = 0;
 var healthcheck_probe_match_body_len: usize = 0;
-var healthcheck_probe_match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8 = [_]u8{0} ** MAX_PROBE_MATCH_BODY_LEN;
+var healthcheck_probe_match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8 = @splat(0);
 var healthcheck_worker_events_channel: ngx_str_t = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
 var healthcheck_worker_events_zone: ngx_str_t = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
 
@@ -303,7 +303,7 @@ var upstream_probe_count: usize = 0;
 
 var peer_probes: [MAX_PEER_PROBES]PeerProbeEntry = undefined;
 var peer_probe_count: usize = 0;
-var peer_probe_index_slots: [PEER_PROBE_INDEX_SLOTS]u8 = [_]u8{0} ** PEER_PROBE_INDEX_SLOTS;
+var peer_probe_index_slots: [PEER_PROBE_INDEX_SLOTS]u8 = @splat(0);
 
 // ── Shared memory helpers ────────────────────────────────────────────────────
 
@@ -593,7 +593,7 @@ fn performProbeWith(
     match_status_max: ngx_uint_t,
     match_body: []const u8,
 ) ProbeResult {
-    var port_buf: [6:0]u8 = [_:0]u8{0} ** 6;
+    var port_buf: [6:0]u8 = @splat(0);
     const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
     port_buf[port_slice.len] = 0;
 
@@ -747,7 +747,7 @@ fn performActiveProbe() ProbeResult {
     if (!healthcheck_probe_enabled or healthcheck_probe_host_len == 0) {
         return .{ .success = true, .status = 0, .match_status_ok = true, .match_body_ok = true };
     }
-    var host_cstr_buf: [MAX_PROBE_HOST_LEN + 1]u8 = [_]u8{0} ** (MAX_PROBE_HOST_LEN + 1);
+    var host_cstr_buf: [MAX_PROBE_HOST_LEN + 1]u8 = @splat(0);
     @memcpy(host_cstr_buf[0..healthcheck_probe_host_len], healthcheck_probe_host_buf[0..healthcheck_probe_host_len]);
     return performProbeWith(
         host_cstr_buf[0..healthcheck_probe_host_len :0],

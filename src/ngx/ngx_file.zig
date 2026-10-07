@@ -18,7 +18,7 @@ fn pathZ(path: []const u8, storage: []u8) ![:0]u8 {
 }
 
 fn interrupted() bool {
-    return c._errno().* == @intFromEnum(c.E.INTR);
+    return c._errno().* == @backingInt(c.E.INTR);
 }
 
 pub fn exists(path: []const u8) bool {
@@ -29,7 +29,7 @@ pub fn exists(path: []const u8) bool {
 
 fn ensureDirectory(path: [*:0]const u8) !void {
     if (c.mkdir(path, 0o755) == 0) return;
-    if (c._errno().* != @intFromEnum(c.E.EXIST)) return error.MkdirFailed;
+    if (c._errno().* != @backingInt(c.E.EXIST)) return error.MkdirFailed;
     var info: ngx_file_info_t = undefined;
     if (stat(path, &info) != 0 or !c.S.ISDIR(info.st_mode)) return error.NotDirectory;
 }
@@ -108,8 +108,8 @@ pub fn removeTree(path: []const u8) !void {
 
 fn removeTreeAt(parent: c_int, name: [*:0]const u8) error{ DeleteFailed, OpenFailed, ReadFailed }!void {
     if (c.unlinkat(parent, name, 0) == 0) return;
-    if (c._errno().* == @intFromEnum(c.E.NOENT)) return;
-    if (c._errno().* != @intFromEnum(c.E.ISDIR)) return error.DeleteFailed;
+    if (c._errno().* == @backingInt(c.E.NOENT)) return;
+    if (c._errno().* != @backingInt(c.E.ISDIR)) return error.DeleteFailed;
     const fd = c.openat(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
     if (fd < 0) return error.OpenFailed;
     const dir = c.fdopendir(fd) orelse {
@@ -127,7 +127,7 @@ fn removeTreeAt(parent: c_int, name: [*:0]const u8) error{ DeleteFailed, OpenFai
         if (std.mem.eql(u8, child, ".") or std.mem.eql(u8, child, "..")) continue;
         try removeTreeAt(fd, @ptrCast(child.ptr)); // readdir names are NUL-terminated
     }
-    if (c.unlinkat(parent, name, c.AT.REMOVEDIR) != 0 and c._errno().* != @intFromEnum(c.E.NOENT)) return error.DeleteFailed;
+    if (c.unlinkat(parent, name, c.AT.REMOVEDIR) != 0 and c._errno().* != @backingInt(c.E.NOENT)) return error.DeleteFailed;
 }
 
 const off_t = core.off_t;

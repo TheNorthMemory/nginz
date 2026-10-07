@@ -98,8 +98,7 @@ fn should_route_to_canary(r: [*c]ngx_http_request_t, lccf: *canary_loc_conf) boo
         // Generate random number 0-99
         var random_byte: [1]u8 = undefined;
         if (std.c.getrandom(&random_byte, random_byte.len, 0) != random_byte.len) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0,
-                "canary: entropy acquisition failed; routing to stable", .{});
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0, "canary: entropy acquisition failed; routing to stable", .{});
             return false;
         }
         const random_value: u32 = @as(u32, random_byte[0]) * 100 / 256;
@@ -309,8 +308,7 @@ export var ngx_http_canary_module = ngx.module.make_module(
 const expectEqual = std.testing.expectEqual;
 const expect = std.testing.expect;
 
-test "canary module" {
-}
+test "canary module" {}
 
 test "explicit zero percentage does not inherit" {
     var parent: canary_loc_conf = std.mem.zeroes(canary_loc_conf);

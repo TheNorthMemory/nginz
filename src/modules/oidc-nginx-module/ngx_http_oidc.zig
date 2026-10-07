@@ -159,7 +159,7 @@ fn fetchHttpsBody(pool: [*c]ngx_pool_t, fd: c_int, host: []const u8, request: []
     defer SSL_free(conn);
     if (SSL_set_fd(conn, fd) != 1) return null;
 
-    const host_z = allocator.dupeZ(u8, host) catch return null;
+    const host_z = allocator.dupeSentinel(u8, host, 0) catch return null;
     defer allocator.free(host_z);
     if (SSL_ctrl(conn, SSL_CTRL_SET_TLSEXT_HOSTNAME_C, TLSEXT_NAMETYPE_HOST_NAME_C, host_z.ptr) != 1) return null;
     if (SSL_set1_host(conn, host_z.ptr) != 1) return null;
@@ -484,7 +484,7 @@ fn cleanupMetadata(data: ?*anyopaque) callconv(.c) void {
 fn fetchUrlBody(pool: [*c]ngx_pool_t, url: []const u8) ?[]u8 {
     const allocator = core.poolAllocator(pool);
     if (std.mem.indexOf(u8, url, "://") == null) {
-        const path_z = allocator.dupeZ(u8, url) catch return null;
+        const path_z = allocator.dupeSentinel(u8, url, 0) catch return null;
         defer allocator.free(path_z);
 
         const mode = "rb";
@@ -521,12 +521,12 @@ fn fetchUrlBody(pool: [*c]ngx_pool_t, url: []const u8) ?[]u8 {
 
     const host_slice = core.slicify(u8, parsed_host.host.data, parsed_host.host.len);
     const path_slice = core.slicify(u8, parsed_host.path.data, parsed_host.path.len);
-    const host_z = allocator.dupeZ(u8, host_slice) catch return null;
+    const host_z = allocator.dupeSentinel(u8, host_slice, 0) catch return null;
     defer allocator.free(host_z);
 
     var port_buf: [16]u8 = undefined;
     const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{parsed_host.port}) catch return null;
-    const port_z = allocator.dupeZ(u8, port_slice) catch return null;
+    const port_z = allocator.dupeSentinel(u8, port_slice, 0) catch return null;
     defer allocator.free(port_z);
 
     var hints: std.posix.addrinfo = .{
@@ -2686,10 +2686,14 @@ test "PKCE S256 challenge and fixed-length state comparison" {
     // RFC 7636 Appendix B.
     const challenge = generateCodeChallenge(pool, "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") orelse return error.SSL_ERROR;
     try std.testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", challenge.data[0..challenge.len]);
-    const token = "a" ** 64;
-    try std.testing.expect(timingSafeTokenEql(token, token));
-    try std.testing.expect(!timingSafeTokenEql(token, "b" ++ "a" ** 63));
-    try std.testing.expect(!timingSafeTokenEql(token, "a" ** 63 ++ "b"));
+    const token: [64]u8 = @splat('a');
+    var b_then_a: [64]u8 = @splat('a');
+    b_then_a[0] = 'b';
+    var a_then_b: [64]u8 = @splat('a');
+    a_then_b[63] = 'b';
+    try std.testing.expect(timingSafeTokenEql(&token, &token));
+    try std.testing.expect(!timingSafeTokenEql(&token, &b_then_a));
+    try std.testing.expect(!timingSafeTokenEql(&token, &a_then_b));
     try std.testing.expect(!timingSafeTokenEql("", ""));
-    try std.testing.expect(!timingSafeTokenEql(token, "a" ** 63));
+    try std.testing.expect(!timingSafeTokenEql(&token, token[0..63]));
 }

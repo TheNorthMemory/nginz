@@ -40,20 +40,20 @@ pub fn ngz_log_error(level: ngx_uint_t, log: [*c]ngx_log_t, err: ngx_err_t, fmt:
     if (info != .@"struct") {
         @compileError("expected tuple or struct argument, found " ++ @typeName(ArgsType));
     }
-    if (info.@"struct".fields.len > 8) {
+    if (info.@"struct".field_types.len > 8) {
         @compileError("too many args");
     }
     if (log.*.log_level >= level) {
-        switch (info.@"struct".fields.len) {
+        switch (info.@"struct".field_types.len) {
             0 => ngx_log_error_core(level, log, err, fmt),
-            1 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0])),
-            2 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1])),
-            3 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2])),
-            4 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3])),
-            5 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4])),
-            6 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5])),
-            7 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5]), @as(info.@"struct".fields[6].type, args[6])),
-            8 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5]), @as(info.@"struct".fields[6].type, args[6]), @as(info.@"struct".fields[7].type, args[7])),
+            1 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0])),
+            2 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1])),
+            3 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2])),
+            4 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3])),
+            5 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4])),
+            6 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5])),
+            7 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5]), @as(info.@"struct".field_types[6], args[6])),
+            8 => ngx_log_error_core(level, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5]), @as(info.@"struct".field_types[6], args[6]), @as(info.@"struct".field_types[7], args[7])),
             else => unreachable,
         }
     }
@@ -65,20 +65,20 @@ pub fn ngz_log_debug(level: ngx_uint_t, log: [*c]ngx_log_t, err: ngx_err_t, fmt:
     if (info != .@"struct") {
         @compileError("expected tuple or struct argument, found " ++ @typeName(ArgsType));
     }
-    if (info.@"struct".fields.len > 8) {
+    if (info.@"struct".field_types.len > 8) {
         @compileError("too many args");
     }
     if (log.*.log_level & level > 0) {
-        switch (info.@"struct".fields.len) {
+        switch (info.@"struct".field_types.len) {
             0 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt),
-            1 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0])),
-            2 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1])),
-            3 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2])),
-            4 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3])),
-            5 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4])),
-            6 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5])),
-            7 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5]), @as(info.@"struct".fields[6].type, args[6])),
-            8 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".fields[0].type, args[0]), @as(info.@"struct".fields[1].type, args[1]), @as(info.@"struct".fields[2].type, args[2]), @as(info.@"struct".fields[3].type, args[3]), @as(info.@"struct".fields[4].type, args[4]), @as(info.@"struct".fields[5].type, args[5]), @as(info.@"struct".fields[6].type, args[6]), @as(info.@"struct".fields[7].type, args[7])),
+            1 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0])),
+            2 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1])),
+            3 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2])),
+            4 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3])),
+            5 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4])),
+            6 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5])),
+            7 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5]), @as(info.@"struct".field_types[6], args[6])),
+            8 => ngx_log_error_core(NGX_LOG_DEBUG, log, err, fmt, @as(info.@"struct".field_types[0], args[0]), @as(info.@"struct".field_types[1], args[1]), @as(info.@"struct".field_types[2], args[2]), @as(info.@"struct".field_types[3], args[3]), @as(info.@"struct".field_types[4], args[4]), @as(info.@"struct".field_types[5], args[5]), @as(info.@"struct".field_types[6], args[6]), @as(info.@"struct".field_types[7], args[7])),
             else => unreachable,
         }
     }

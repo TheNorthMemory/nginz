@@ -483,7 +483,7 @@ pub extern fn PQsendPipelineSync(conn: ?*PGconn) c_int;
 pub extern fn PQnotifies(conn: ?*PGconn) [*c]PGnotify;
 pub extern fn PQputCopyData(conn: ?*PGconn, buffer: [*c]const u8, nbytes: c_int) c_int;
 pub extern fn PQputCopyEnd(conn: ?*PGconn, errormsg: [*c]const u8) c_int;
-pub extern fn PQgetCopyData(conn: ?*PGconn, buffer: [*c][*c]u8, @"async": c_int) c_int;
+pub extern fn PQgetCopyData(conn: ?*PGconn, buffer: [*c][*c]u8, async: c_int) c_int;
 pub extern fn PQgetline(conn: ?*PGconn, buffer: [*c]u8, length: c_int) c_int;
 pub extern fn PQputline(conn: ?*PGconn, string: [*c]const u8) c_int;
 pub extern fn PQgetlineAsync(conn: ?*PGconn, buffer: [*c]u8, bufsize: c_int) c_int;
@@ -580,7 +580,7 @@ pub const PGpromptOAuthDevice = struct__PGpromptOAuthDevice;
 pub const struct__PGoauthBearerRequest = extern struct {
     openid_configuration: [*c]const u8 = @import("std").mem.zeroes([*c]const u8),
     scope: [*c]const u8 = @import("std").mem.zeroes([*c]const u8),
-    @"async": ?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest, [*c]c_int) callconv(.c) PostgresPollingStatusType = @import("std").mem.zeroes(?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest, [*c]c_int) callconv(.c) PostgresPollingStatusType),
+    async: ?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest, [*c]c_int) callconv(.c) PostgresPollingStatusType = @import("std").mem.zeroes(?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest, [*c]c_int) callconv(.c) PostgresPollingStatusType),
     cleanup: ?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest) callconv(.c) void = @import("std").mem.zeroes(?*const fn (?*PGconn, [*c]struct__PGoauthBearerRequest) callconv(.c) void),
     token: [*c]u8 = @import("std").mem.zeroes([*c]u8),
     user: ?*anyopaque = @import("std").mem.zeroes(?*anyopaque),

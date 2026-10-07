@@ -1048,7 +1048,7 @@ pub const ngx_resolver_ctx_t = struct_ngx_resolver_ctx_s;
 pub const ngx_resolver_handler_pt = ?*const fn ([*c]ngx_resolver_ctx_t) callconv(.c) void;
 const struct_ngx_resolver_ctx_flags_s = packed struct(u32) {
     quick: bool,
-    @"async": bool,
+    async: bool,
     cancelable: bool,
     padding: u29,
 };
@@ -2592,7 +2592,7 @@ pub const struct_ngx_http_core_loc_conf_s = extern struct {
     thread_pool_value: [*c]ngx_http_complex_value_t = @import("std").mem.zeroes([*c]ngx_http_complex_value_t),
     disable_symlinks: ngx_uint_t = @import("std").mem.zeroes(ngx_uint_t),
     disable_symlinks_from: [*c]ngx_http_complex_value_t = @import("std").mem.zeroes([*c]ngx_http_complex_value_t),
-    early_hints: [*c]ngx_array_t =  @import("std").mem.zeroes([*c]ngx_array_t),
+    early_hints: [*c]ngx_array_t = @import("std").mem.zeroes([*c]ngx_array_t),
     error_pages: [*c]ngx_array_t = @import("std").mem.zeroes([*c]ngx_array_t),
     client_body_temp_path: [*c]ngx_path_t = @import("std").mem.zeroes([*c]ngx_path_t),
     open_file_cache: [*c]ngx_open_file_cache_t = @import("std").mem.zeroes([*c]ngx_open_file_cache_t),

@@ -330,29 +330,63 @@ fn json_escape_into(dst: []u8, src: []const u8) usize {
     var pos: usize = 0;
     for (src) |c| {
         switch (c) {
-            '"' => { dst[pos] = '\\'; dst[pos + 1] = '"'; pos += 2; },
-            '\\' => { dst[pos] = '\\'; dst[pos + 1] = '\\'; pos += 2; },
-            '\n' => { dst[pos] = '\\'; dst[pos + 1] = 'n'; pos += 2; },
-            '\r' => { dst[pos] = '\\'; dst[pos + 1] = 'r'; pos += 2; },
-            '\t' => { dst[pos] = '\\'; dst[pos + 1] = 't'; pos += 2; },
+            '"' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = '"';
+                pos += 2;
+            },
+            '\\' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = '\\';
+                pos += 2;
+            },
+            '\n' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 'n';
+                pos += 2;
+            },
+            '\r' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 'r';
+                pos += 2;
+            },
+            '\t' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 't';
+                pos += 2;
+            },
             0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
                 const hex = "0123456789abcdef";
-                dst[pos] = '\\'; dst[pos + 1] = 'u'; dst[pos + 2] = '0'; dst[pos + 3] = '0';
-                dst[pos + 4] = hex[(c >> 4) & 0xF]; dst[pos + 5] = hex[c & 0xF];
+                dst[pos] = '\\';
+                dst[pos + 1] = 'u';
+                dst[pos + 2] = '0';
+                dst[pos + 3] = '0';
+                dst[pos + 4] = hex[(c >> 4) & 0xF];
+                dst[pos + 5] = hex[c & 0xF];
                 pos += 6;
             },
-            else => { dst[pos] = c; pos += 1; },
+            else => {
+                dst[pos] = c;
+                pos += 1;
+            },
         }
     }
     return pos;
 }
 
 fn write_usize_into(out: []u8, value: usize) usize {
-    if (value == 0) { out[0] = '0'; return 1; }
+    if (value == 0) {
+        out[0] = '0';
+        return 1;
+    }
     var v = value;
     var pos: usize = 0;
     var tmp: [20]u8 = undefined;
-    while (v > 0) { tmp[pos] = @as(u8, @intCast((v % 10) + '0')); pos += 1; v /= 10; }
+    while (v > 0) {
+        tmp[pos] = @as(u8, @intCast((v % 10) + '0'));
+        pos += 1;
+        v /= 10;
+    }
     for (0..pos) |i| out[i] = tmp[pos - 1 - i];
     return pos;
 }

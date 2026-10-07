@@ -83,7 +83,7 @@ pub inline fn ngx_queue_add(h: [*c]ngx_queue_t, n: [*c]ngx_queue_t) void {
 pub inline fn ngz_queue_data(comptime T: type, comptime field: []const u8, q: [*c]ngx_queue_t) [*c]T {
     return @as(
         [*c]T,
-        @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(q))) - @offsetOf(T, field))),
+        @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(q))) - @offsetOf(T, field))),
     );
 }
 
@@ -113,7 +113,7 @@ pub fn NQueue(comptime T: type, comptime field: []const u8) type {
             defer self.n = ngx_queue_next(self.n);
             return @as(
                 [*c]T,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(self.n))) - OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(self.n))) - OFFSET)),
             );
         }
     };
@@ -131,7 +131,7 @@ pub fn NQueue(comptime T: type, comptime field: []const u8) type {
             defer self.n = ngx_queue_prev(self.n);
             return @as(
                 [*c]T,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(self.n))) - OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(self.n))) - OFFSET)),
             );
         }
     };
@@ -144,14 +144,14 @@ pub fn NQueue(comptime T: type, comptime field: []const u8) type {
         pub inline fn queue(pt: [*c]T) [*c]ngx_queue_t {
             return @as(
                 [*c]ngx_queue_t,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(pt))) + OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(pt))) + OFFSET)),
             );
         }
 
         pub inline fn data(q: [*c]ngx_queue_t) [*c]T {
             return @as(
                 [*c]T,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(q))) - OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(q))) - OFFSET)),
             );
         }
 

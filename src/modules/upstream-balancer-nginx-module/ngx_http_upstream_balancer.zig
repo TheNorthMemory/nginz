@@ -288,9 +288,9 @@ fn install_init_upstream_hook(cf: [*c]ngx_conf_t) bool {
 
     if (bcf.*.original_init_upstream == null) {
         bcf.*.original_init_upstream = if (uscf.*.peer.init_upstream) |f|
-            @constCast(@ptrCast(f))
+            @ptrCast(@constCast(f))
         else
-            @constCast(@ptrCast(&ngx_http_upstream_init_round_robin));
+            @ptrCast(@constCast(&ngx_http_upstream_init_round_robin));
         uscf.*.peer.init_upstream = upstream_balancer_init_upstream;
     }
     return true;
@@ -415,7 +415,7 @@ fn bindDynamicPeerSource(
     const tried_words = triedWordCount(total_peers);
     const tried_mem = core.castPtr(usize, core.ngx_pcalloc(r.*.pool, tried_words * @sizeOf(usize))) orelse return core.NGX_ERROR;
 
-    applyDynamicPeerGraph(ctx, rrp, peers, tried_mem, generation, bcf.peer_source_ctx, @constCast(@ptrCast(vtable.release_generation)));
+    applyDynamicPeerGraph(ctx, rrp, peers, tried_mem, generation, bcf.peer_source_ctx, @ptrCast(@constCast(vtable.release_generation)));
     transferred = true;
     incrementMetric(.runtime_peer_source_requests_total);
     return core.NGX_OK;
@@ -563,7 +563,8 @@ export fn ngx_http_upstream_balancer_status_handler(r: [*c]ngx_http_request_t) c
     const snapshot = snapshotMetrics() orelse
         return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, string.ngx_string("{\"module\":\"upstream_balancer\",\"status\":\"error\",\"error\":\"metrics unavailable\"}"));
     var body_buf: [1024]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf,
+    const body = std.fmt.bufPrint(
+        &body_buf,
         "{{\"module\":\"upstream_balancer\",\"status\":\"ok\",\"requests_total\":{d},\"sticky_cookie_requests_total\":{d},\"sticky_header_requests_total\":{d},\"runtime_peer_source_requests_total\":{d},\"direct_peer_hits\":{d},\"hash_hits\":{d},\"key_absent_misses\":{d},\"direct_peer_misses\":{d},\"fallback_next_total\":{d},\"fallback_off_total\":{d},\"cookies_issued_total\":{d},\"cookies_rotated_total\":{d},\"peer_rejections_tried_total\":{d},\"peer_rejections_unhealthy_total\":{d},\"peer_rejections_slow_start_total\":{d},\"peer_rejections_fail_window_total\":{d},\"peer_rejections_max_conns_total\":{d},\"peer_rejections_draining_total\":{d}}}",
         .{
             snapshot.requests_total,
@@ -616,11 +617,10 @@ export fn upstream_balancer_init_upstream(
     if (orig_fn(cf, us) != core.NGX_OK) return core.NGX_ERROR;
 
     bcf.*.upstream_name = us.*.host;
-    bcf.*.original_init_peer = @constCast(@ptrCast(us.*.peer.init));
+    bcf.*.original_init_peer = @ptrCast(@constCast(us.*.peer.init));
     us.*.peer.init = upstream_balancer_init_peer;
 
-    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, cf.*.log, 0,
-        "upstream_balancer: callback installed\x00", .{});
+    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, cf.*.log, 0, "upstream_balancer: callback installed\x00", .{});
 
     return core.NGX_OK;
 }
@@ -646,8 +646,8 @@ export fn upstream_balancer_init_peer(
     ctx.conf_ptr = @ptrCast(bcf);
     ctx.request_ptr = @ptrCast(r);
     ctx.original_data = u.*.peer.data;
-    ctx.original_get = @constCast(@ptrCast(u.*.peer.get));
-    ctx.original_free = @constCast(@ptrCast(u.*.peer.free));
+    ctx.original_get = @ptrCast(@constCast(u.*.peer.get));
+    ctx.original_free = @ptrCast(@constCast(u.*.peer.free));
     ctx.sticky_used = 0;
     ctx.pending_cookie = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
     ctx.pending_cookie_rotate = 0;
@@ -914,13 +914,11 @@ export fn upstream_balancer_get_peer(
         incrementMetric(.key_absent_misses);
         if (bcf.*.fallback_mode == FALLBACK_OFF) {
             incrementMetric(.fallback_off_total);
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0,
-                "upstream_balancer: sticky key absent, fallback off\x00", .{});
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0, "upstream_balancer: sticky key absent, fallback off\x00", .{});
             return core.NGX_BUSY;
         }
         incrementMetric(.fallback_next_total);
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0,
-            "upstream_balancer: sticky key absent, fallback next\x00", .{});
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0, "upstream_balancer: sticky key absent, fallback next\x00", .{});
         const rc = orig_get(pc, ctx.original_data);
         if (rc == core.NGX_OK) {
             if (rrp.*.current != null) {
@@ -997,8 +995,7 @@ export fn upstream_balancer_get_peer(
         incrementMetric(if (direct_target != null) .direct_peer_hits else .hash_hits);
     }
 
-    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0,
-        "upstream_balancer: sticky hit\x00", .{});
+    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0, "upstream_balancer: sticky hit\x00", .{});
 
     return core.NGX_OK;
 }
@@ -1033,7 +1030,7 @@ export fn upstream_balancer_ensure_hook(
     // init_upstream has already run; us->peer.init is now round-robin's init_peer
     if (us.*.peer.init == null) return core.NGX_ERROR;
 
-    bcf.*.original_init_peer = @constCast(@ptrCast(us.*.peer.init));
+    bcf.*.original_init_peer = @ptrCast(@constCast(us.*.peer.init));
     bcf.*.upstream_name = us.*.host;
     us.*.peer.init = upstream_balancer_init_peer;
     return core.NGX_OK;
@@ -1208,7 +1205,7 @@ var test_release_generation_value: u64 = 0;
 var test_is_peer_draining_calls: usize = 0;
 var test_is_peer_draining_source_ctx: ?*anyopaque = null;
 var test_is_peer_draining_addr_len: usize = 0;
-var test_is_peer_draining_addr: [64]u8 = [_]u8{0} ** 64;
+var test_is_peer_draining_addr: [64]u8 = @splat(0);
 
 fn testReleaseGeneration(
     source_ctx: ?*anyopaque,
@@ -1250,7 +1247,7 @@ test "dynamic peer graph can be pinned and released once per request ctx" {
         @ptrCast(&tried_buf),
         77,
         null,
-        @constCast(@ptrCast(&testReleaseGeneration)),
+        @ptrCast(@constCast(&testReleaseGeneration)),
     );
 
     try std.testing.expectEqual(@as(core.ngx_flag_t, 1), ctx.dynamic_active);
@@ -1273,7 +1270,7 @@ test "request cleanup is an idempotent generation release backstop" {
     var ctx: BalancerRequestCtx = std.mem.zeroes(BalancerRequestCtx);
     ctx.dynamic_peers = @ptrFromInt(@alignOf(ngx_http_upstream_rr_peers_t));
     ctx.dynamic_generation = 91;
-    ctx.dynamic_release_generation = @constCast(@ptrCast(&testReleaseGeneration));
+    ctx.dynamic_release_generation = @ptrCast(@constCast(&testReleaseGeneration));
     ctx.dynamic_active = 1;
 
     cleanupDynamicPeerGraph(&ctx);
@@ -1307,7 +1304,7 @@ test "peer source draining helper delegates to callback" {
     const vtable = PeerSourceVTable{
         .get_active_peers = null,
         .release_generation = null,
-        .is_peer_draining = @constCast(@ptrCast(&testIsPeerDraining)),
+        .is_peer_draining = @ptrCast(@constCast(&testIsPeerDraining)),
     };
 
     try std.testing.expect(peerSourceIsDraining(&source_value, &vtable, &addr, addr.len));

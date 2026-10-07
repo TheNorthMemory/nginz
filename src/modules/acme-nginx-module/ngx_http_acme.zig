@@ -1054,7 +1054,7 @@ pub const AcmeOrder = struct {
             .order_url = ngx_null_str,
             .finalize_url = ngx_null_str,
             .certificate_url = ngx_null_str,
-            .authorization_urls = [_]ngx_str_t{ngx_null_str} ** 8,
+            .authorization_urls = @splat(ngx_null_str),
             .authorization_count = 0,
             .status = ngx_null_str,
         };
@@ -1068,7 +1068,7 @@ pub const AcmeOrder = struct {
 
         self.finalize_url = ngx_null_str;
         self.certificate_url = ngx_null_str;
-        self.authorization_urls = [_]ngx_str_t{ngx_null_str} ** 8;
+        self.authorization_urls = @splat(ngx_null_str);
         self.authorization_count = 0;
         self.status = ngx_null_str;
 
@@ -2001,7 +2001,7 @@ fn get_or_create_session_entry(store: *acme_store, domain: []const u8) ?*acme_se
                 entry.* = std.mem.zeroes(acme_session_entry);
                 return null;
             }
-            entry.*.state = @intFromEnum(AcmeState.idle);
+            entry.*.state = @backingInt(AcmeState.idle);
             store.session_count += 1;
             return entry;
         }
@@ -2029,7 +2029,7 @@ fn load_client_from_session(
 ) !AcmeClient {
     var client = AcmeClient.init(pool, directory_url, domain);
 
-    client.state = @enumFromInt(entry.state);
+    client.state = @fromBackingInt(@intCast(entry.state));
     client.directory_url = try session_string_to_pool(pool, fixed_string_slice(&entry.directory_url, entry.directory_url_len));
     if (client.directory_url.len == 0) {
         client.directory_url = directory_url;
@@ -2061,7 +2061,7 @@ fn load_client_from_session(
 }
 
 fn save_client_to_session(entry: *acme_session_entry, client: *const AcmeClient) !void {
-    entry.*.state = @intFromEnum(client.state);
+    entry.*.state = @backingInt(client.state);
     entry.*.current_auth_index = client.current_auth_index;
     entry.*.authorization_count = client.order.authorization_count;
     try session_write_ngx_str(&entry.*.directory_url, &entry.*.directory_url_len, client.directory_url);
@@ -2092,7 +2092,7 @@ fn save_client_to_session(entry: *acme_session_entry, client: *const AcmeClient)
 }
 
 fn initialize_session_for_domain(entry: *acme_session_entry, mcf: *acme_main_conf, domain: ngx_str_t) !void {
-    entry.*.state = @intFromEnum(AcmeState.need_directory);
+    entry.*.state = @backingInt(AcmeState.need_directory);
     entry.*.current_auth_index = 0;
     entry.*.authorization_count = 0;
     try session_write_ngx_str(&entry.*.domain, &entry.*.domain_len, domain);
@@ -3017,7 +3017,7 @@ export fn ngx_http_acme_trigger_handler(r: [*c]ngx_http_request_t) callconv(.c) 
         return send_acme_status_code_and_finalize(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, "error", "Shared ACME session store full");
     };
 
-    const was_initialized = session.*.directory_url_len > 0 or session.*.state != @intFromEnum(AcmeState.idle);
+    const was_initialized = session.*.directory_url_len > 0 or session.*.state != @backingInt(AcmeState.idle);
     if (!was_initialized) {
         initialize_session_for_domain(session, mcf, scf.*.domain) catch {
             if (shpool) |sp| shm.ngx_shmtx_unlock(&sp.*.mutex);

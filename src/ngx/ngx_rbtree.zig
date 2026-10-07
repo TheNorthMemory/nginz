@@ -22,7 +22,7 @@ pub inline fn ngx_rbtree_init(tree: [*c]ngx_rbtree_t, s: [*c]ngx_rbtree_node_t, 
 pub inline fn ngz_rbtree_data(comptime T: type, comptime field: []const u8, n: [*c]ngx_rbtree_node_t) [*c]T {
     return @as(
         [*c]T,
-        @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(n))) - @offsetOf(T, field))),
+        @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(n))) - @offsetOf(T, field))),
     );
 }
 
@@ -241,14 +241,14 @@ pub fn NRBTree(
         pub inline fn node(pt: [*c]T) [*c]Node {
             return @as(
                 [*c]Node,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(pt))) + OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(pt))) + OFFSET)),
             );
         }
 
         pub inline fn data(n: [*c]Node) [*c]T {
             return @as(
                 [*c]T,
-                @alignCast(@ptrCast(@as([*c]u8, @alignCast(@ptrCast(n))) - OFFSET)),
+                @ptrCast(@alignCast(@as([*c]u8, @ptrCast(@alignCast(n))) - OFFSET)),
             );
         }
 

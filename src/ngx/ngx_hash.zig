@@ -74,13 +74,13 @@ pub fn NHash(comptime K: type, comptime V: type, comptime M: ngx_uint_t) type {
             keys.temp_pool = ctx.*.temp_pool;
             keys.pool = ctx.*.pool;
 
-            if (ngx_hash_keys_array_init(&keys, @intCast(@intFromEnum(ctx.*.type))) != core.NGX_OK) {
+            if (ngx_hash_keys_array_init(&keys, @intCast(@backingInt(ctx.*.type))) != core.NGX_OK) {
                 return core.NError.HASH_ERROR;
             }
 
             for (kv) |*kv0| {
                 const str = ngx_str_t{ .len = ctx.*.len(kv0.key_ptr), .data = ctx.*.data(kv0.key_ptr) };
-                if (ngx_hash_add_key(&keys, @constCast(&str), @alignCast(@ptrCast(kv0)), NGX_HASH_READONLY_KEY) != core.NGX_OK) {
+                if (ngx_hash_add_key(&keys, @constCast(&str), @ptrCast(@alignCast(kv0)), NGX_HASH_READONLY_KEY) != core.NGX_OK) {
                     return core.NError.HASH_ERROR;
                 }
             }
@@ -202,8 +202,8 @@ pub fn ZHash(comptime K: type, comptime V: type, comptime Ctx: type, comptime M:
                         const allocator = fba.allocator();
                         hash.* = HashMap.init(allocator);
                         return Self{
-                            .hash = @alignCast(@ptrCast(hash)),
-                            .fba = @alignCast(@ptrCast(fba)),
+                            .hash = @ptrCast(@alignCast(hash)),
+                            .fba = @ptrCast(@alignCast(fba)),
                             .ready = 1,
                         };
                     }
@@ -217,27 +217,27 @@ pub fn ZHash(comptime K: type, comptime V: type, comptime Ctx: type, comptime M:
         }
 
         pub fn put(self: *Self, k: K, v: V) !void {
-            var h: *HashMap = @alignCast(@ptrCast(self.hash));
+            var h: *HashMap = @ptrCast(@alignCast(self.hash));
             try h.put(k, v);
         }
 
         pub fn iterator(self: *Self) Iterator {
-            var h: *HashMap = @alignCast(@ptrCast(self.hash));
+            var h: *HashMap = @ptrCast(@alignCast(self.hash));
             return h.iterator();
         }
 
         pub fn getPtr(self: *Self, k: K) ?*V {
-            var h: *HashMap = @alignCast(@ptrCast(self.hash));
+            var h: *HashMap = @ptrCast(@alignCast(self.hash));
             return h.getPtr(k);
         }
 
         pub fn size(self: *Self) ngx_uint_t {
-            var h: *HashMap = @alignCast(@ptrCast(self.hash));
+            var h: *HashMap = @ptrCast(@alignCast(self.hash));
             return h.count();
         }
 
         pub fn deinit(self: *Self) void {
-            var h: *HashMap = @alignCast(@ptrCast(self.hash));
+            var h: *HashMap = @ptrCast(@alignCast(self.hash));
             h.deinit();
         }
     };

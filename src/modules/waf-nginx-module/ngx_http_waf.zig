@@ -2045,15 +2045,15 @@ fn sendBlockedResponse(r: [*c]ngx_http_request_t, rule_type: []const u8, status:
 fn logDetection(r: [*c]ngx_http_request_t, rule_type: []const u8, pattern: []const u8, tag: []const u8, logdata: []const u8) void {
     var msg_buf: [384]u8 = undefined;
     const message = if (tag.len > 0 and logdata.len > 0 and pattern.len > 0)
-        std.fmt.bufPrintZ(&msg_buf, "WAF: {s} rule matched: {s}; tag={s}; logdata={s}", .{ rule_type, pattern, tag, logdata }) catch "WAF: rule matched"
+        std.fmt.bufPrintSentinel(&msg_buf, "WAF: {s} rule matched: {s}; tag={s}; logdata={s}", .{ rule_type, pattern, tag, logdata }, 0) catch "WAF: rule matched"
     else if (tag.len > 0 and pattern.len > 0)
-        std.fmt.bufPrintZ(&msg_buf, "WAF: {s} rule matched: {s}; tag={s}", .{ rule_type, pattern, tag }) catch "WAF: rule matched"
+        std.fmt.bufPrintSentinel(&msg_buf, "WAF: {s} rule matched: {s}; tag={s}", .{ rule_type, pattern, tag }, 0) catch "WAF: rule matched"
     else if (logdata.len > 0 and pattern.len > 0)
-        std.fmt.bufPrintZ(&msg_buf, "WAF: {s} rule matched: {s}; logdata={s}", .{ rule_type, pattern, logdata }) catch "WAF: rule matched"
+        std.fmt.bufPrintSentinel(&msg_buf, "WAF: {s} rule matched: {s}; logdata={s}", .{ rule_type, pattern, logdata }, 0) catch "WAF: rule matched"
     else if (pattern.len > 0)
-        std.fmt.bufPrintZ(&msg_buf, "WAF: {s} rule matched: {s}", .{ rule_type, pattern }) catch "WAF: rule matched"
+        std.fmt.bufPrintSentinel(&msg_buf, "WAF: {s} rule matched: {s}", .{ rule_type, pattern }, 0) catch "WAF: rule matched"
     else
-        std.fmt.bufPrintZ(&msg_buf, "WAF: {s} rule matched", .{rule_type}) catch "WAF: rule matched";
+        std.fmt.bufPrintSentinel(&msg_buf, "WAF: {s} rule matched", .{rule_type}, 0) catch "WAF: rule matched";
     ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0, message.ptr, .{});
 }
 
@@ -2582,7 +2582,7 @@ fn ngx_conf_set_waf_rules_file(
                 if (load_error) |err| {
                     var err_buf: [512]u8 = undefined;
                     const path_slice = core.slicify(u8, path.data, path.len);
-                    const message = std.fmt.bufPrintZ(&err_buf, "waf_rules_file {s} line {d}: {s}", .{ path_slice, err.line_no, err.reason }) catch "invalid waf_rules_file";
+                    const message = std.fmt.bufPrintSentinel(&err_buf, "waf_rules_file {s} line {d}: {s}", .{ path_slice, err.line_no, err.reason }, 0) catch "invalid waf_rules_file";
                     ngx.log.ngz_log_error(ngx.log.NGX_LOG_EMERG, cf.*.log, 0, message.ptr, .{});
                 }
                 return conf.NGX_CONF_ERROR;

@@ -258,7 +258,7 @@ inline fn write_buf(
 }
 
 inline fn set_type(offset: ngx_int_t) echoz_command_type {
-    return @enumFromInt(@intFromEnum(echoz_command_type.echoz) + offset);
+    return @fromBackingInt(@intCast(@backingInt(echoz_command_type.echoz) + offset));
 }
 
 fn map(

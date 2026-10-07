@@ -760,8 +760,7 @@ export var ngx_http_ratelimit_module = ngx.module.make_module(
 // Tests
 const expectEqual = std.testing.expectEqual;
 
-test "ratelimit module" {
-}
+test "ratelimit module" {}
 
 test "full live table rejects a new key without evicting enforcement state" {
     var store: ratelimit_store = std.mem.zeroes(ratelimit_store);

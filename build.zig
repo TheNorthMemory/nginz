@@ -16,7 +16,7 @@ const check_layout = @import("project/build_check_layout.zig");
 const dynmod = @import("project/build_dynmod.zig");
 
 const NGINX = "src/ngx/nginx.zig";
-const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
 const worker_events_test_file = "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig";
 const healthcheck_test_file = "src/modules/healthcheck-nginx-module/ngx_http_healthcheck.zig";
 const upstream_balancer_test_file = "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig";

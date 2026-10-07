@@ -376,7 +376,7 @@ test "pool allocator grows containers and honors alignment" {
     const aligned = try allocator.alignedAlloc(u8, .@"64", 8192);
     defer allocator.free(aligned);
     try expectEqual(@as(usize, 0), @intFromPtr(aligned.ptr) % 64);
-    const terminated = try allocator.dupeZ(u8, "pool string");
+    const terminated = try allocator.dupeSentinel(u8, "pool string", 0);
     defer allocator.free(terminated);
     try std.testing.expectEqualStrings("pool string", std.mem.span(terminated.ptr));
 }

@@ -1955,8 +1955,8 @@ test "build_limited_write_query renders update with limit and order" {
     const fields = [_]JsonField{.{
         .name = "status",
         .value = "inactive",
-        .name_buf = [_]u8{0} ** 256,
-        .value_buf = [_]u8{0} ** 1024,
+        .name_buf = @splat(0),
+        .value_buf = @splat(0),
         .is_null = false,
         .is_number = false,
         .is_boolean = false,

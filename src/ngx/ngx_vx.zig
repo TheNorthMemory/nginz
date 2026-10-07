@@ -68,7 +68,7 @@ pub const ngx_http_v2_state_t = extern struct {
     field_rest: usize = 0,
     pool: [*c]ngx_pool_t = null,
     stream: [*c]ngx_http_v2_stream_t = null,
-    buffer: [NGX_HTTP_V2_STATE_BUFFER_SIZE]u8 = .{0} ** NGX_HTTP_V2_STATE_BUFFER_SIZE,
+    buffer: [NGX_HTTP_V2_STATE_BUFFER_SIZE]u8 = @splat(0),
     buffer_used: usize = 0,
     handler: ngx_http_v2_handler_pt = null,
 };
@@ -377,7 +377,7 @@ pub const ngx_http_v3_session_t = extern struct {
     payload_bytes: off_t = 0,
     flags: ngx_http_v3_session_flags_s = @bitCast(@as(u32, 0)),
     known_streams: [NGX_HTTP_V3_MAX_KNOWN_STREAM][*c]ngx_connection_t =
-        .{null} ** NGX_HTTP_V3_MAX_KNOWN_STREAM,
+        @splat(null),
 };
 
 // =========================================================================
@@ -407,8 +407,8 @@ pub const ngx_quic_conf_t = extern struct {
     stream_reject_code_bidi: ngx_int_t = 0,
     init: ngx_quic_init_pt = null,
     shutdown: ngx_quic_shutdown_pt = null,
-    av_token_key: [NGX_QUIC_AV_KEY_LEN]u8 = .{0} ** NGX_QUIC_AV_KEY_LEN,
-    sr_token_key: [NGX_QUIC_SR_KEY_LEN]u8 = .{0} ** NGX_QUIC_SR_KEY_LEN,
+    av_token_key: [NGX_QUIC_AV_KEY_LEN]u8 = @splat(0),
+    sr_token_key: [NGX_QUIC_SR_KEY_LEN]u8 = @splat(0),
 };
 
 pub const ngx_http_v3_srv_conf_t = extern struct {
@@ -697,7 +697,7 @@ pub const ngx_stream_upstream_rr_peer_t = extern struct {
     refs: ngx_uint_t = 0,
     host: ?*anyopaque = null, // ngx_stream_upstream_host_t*
     next: [*c]ngx_stream_upstream_rr_peer_t = null,
-    spare: [14]u64 = .{0} ** 14,
+    spare: [14]u64 = @splat(0),
 };
 
 // ngx_stream_upstream_rr_peers_t bit-fields:

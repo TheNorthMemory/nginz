@@ -416,7 +416,7 @@ fn ngx_http_consul_upstream_create_request(
             r.*.connection.*.log,
             0,
             "consul: sending request type=%d",
-            .{@intFromEnum(rctx.*.query_type)},
+            .{@backingInt(rctx.*.query_type)},
         );
     }
     return NGX_OK;

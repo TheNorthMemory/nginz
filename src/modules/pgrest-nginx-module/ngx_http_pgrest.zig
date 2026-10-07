@@ -362,8 +362,8 @@ fn trace_pool_event(ctx: *PgRequestCtx, pool_conn: ?*PgPoolConn, event_name: []c
     trace_set_last_event(ctx, event_name);
     const slot: usize = if (pool_conn) |pc| pool_slot_index(pc) else 9999;
     const fd: c_int = if (pool_conn) |pc| pc.fd else -1;
-    const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
-    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz", .{ ctx.*.trace_req_seq, slot, fd, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
+    const pool_state: c_int = if (pool_conn) |pc| @backingInt(pc.state) else -1;
+    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz", .{ ctx.*.trace_req_seq, slot, fd, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @backingInt(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
 }
 
 fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
@@ -371,11 +371,11 @@ fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
     const pool_conn = ctx.*.pool_conn;
     const slot: usize = if (pool_conn) |pc| pool_slot_index(pc) else 9999;
     const fd: c_int = if (pool_conn) |pc| pc.fd else -1;
-    const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
+    const pool_state: c_int = if (pool_conn) |pc| @backingInt(pc.state) else -1;
     const age = ngx_current_msec - ctx.*.trace_started_msec;
     const stalled = ngx_current_msec - ctx.*.trace_last_progress_msec;
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout req=%uz slot=%uz fd=%d age=%M stalled=%M", .{ ctx.*.trace_req_seq, slot, fd, age, stalled });
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d", .{ ctx.*.trace_req_seq, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d", .{ ctx.*.trace_req_seq, ctx.*.trace_last_event_len, &ctx.*.trace_last_event, @backingInt(ctx.*.query_state), pool_state });
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-stats req=%uz qseq=%uz flush=%d poll=%d rcalls=%uz wcalls=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_query_seq, ctx.*.trace_last_flush_result, ctx.*.trace_last_poll_status, ctx.*.trace_read_calls, ctx.*.trace_write_calls });
     log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-end req=%uz finals=%uz releases=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_finalize_calls, ctx.*.trace_release_calls });
 }
@@ -10625,8 +10625,8 @@ test "build_limited_write_query renders update with limit and order" {
     const fields = [_]JsonField{.{
         .name = "status",
         .value = "inactive",
-        .name_buf = [_]u8{0} ** 256,
-        .value_buf = [_]u8{0} ** 1024,
+        .name_buf = @splat(0),
+        .value_buf = @splat(0),
         .is_null = false,
         .is_number = false,
         .is_boolean = false,
@@ -10832,7 +10832,12 @@ test "RPC query arguments decode once and retain PostgreSQL text input semantics
 }
 
 test "RPC query parser rejects identifier NUL and admission overflow" {
-    const cases = [_][]const u8{ "va%00lue=x", "=x", "value=" ++ "a" ** 8193 };
+    const long_rpc_value = comptime blk: {
+        var s: [6 + 8193]u8 = @splat('a');
+        @memcpy(s[0..6], "value=");
+        break :blk s;
+    };
+    const cases = [_][]const u8{ "va%00lue=x", "=x", &long_rpc_value };
     for (cases) |case| {
         var call: RpcCall = undefined;
         call.param_count = 0;

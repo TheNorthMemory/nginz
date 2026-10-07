@@ -50,7 +50,7 @@ const EXCLUDES = [_][]const u8{
 // ReleaseSmall (-Os + safety checks) which is far cheaper for LLVM while retaining
 // all runtime safety invariants.
 pub fn cap_optimize(opt: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
-    return if (opt == .ReleaseSafe) .ReleaseSmall else opt;
+    return if (opt == .safe) .small else opt;
 }
 
 // Kept as an alias so existing callers don't need to be touched.

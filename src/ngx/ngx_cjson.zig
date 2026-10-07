@@ -418,9 +418,13 @@ test "strict cjson validates complete documents and preserves number spelling" {
     for ([_][]const u8{ "-0", "0.0", "1e0" }, 0..) |expected, i| {
         try std.testing.expectEqualStrings(expected, CJSON.numberLiteral(cJSON_GetArrayItem(values, @intCast(i))).?);
     }
-    const long_number = "1234567890" ** 10;
-    const number = try cj.decodeStrict(ngx_string(long_number));
-    try std.testing.expectEqualStrings(long_number, CJSON.numberLiteral(number).?);
+    const long_number = comptime blk: {
+        var s: [100]u8 = undefined;
+        for (0..10) |i| @memcpy(s[i * 10 ..][0..10], "1234567890");
+        break :blk s;
+    };
+    const number = try cj.decodeStrict(ngx_string(&long_number));
+    try std.testing.expectEqualStrings(&long_number, CJSON.numberLiteral(number).?);
     _ = try cj.decodeStrict(ngx_string("[true,false,null,{},[],1.25e-4,1e999]"));
     for ([_][]const u8{
         "",                         " ",               "{",                   "{ ",                      "{\"x\" ",              "{\"x\": ",            "[",                       "[ ",

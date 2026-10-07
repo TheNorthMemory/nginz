@@ -77,10 +77,19 @@ extern fn EVP_PKEY_set1_RSA(pkey: ?*ssl.EVP_PKEY, key: ?*ssl.RSA) c_int;
 // ── Supported algorithms ──────────────────────────────────────────────
 
 const Algorithm = enum(u8) {
-    HS256, HS384, HS512,
-    RS256, RS384, RS512,
-    ES256, ES384, ES512, ES256K,
-    PS256, PS384, PS512,
+    HS256,
+    HS384,
+    HS512,
+    RS256,
+    RS384,
+    RS512,
+    ES256,
+    ES384,
+    ES512,
+    ES256K,
+    PS256,
+    PS384,
+    PS512,
     EdDSA,
 };
 
@@ -112,12 +121,12 @@ const jwt_claim_entry = extern struct {
 };
 
 const ClaimOp = enum(u8) {
-    eq,  // equal (string comparison)
+    eq, // equal (string comparison)
     neq, // not-equal (string comparison)
-    gt,  // greater-than (numeric)
-    lt,  // less-than (numeric)
-    ge,  // greater-or-equal (numeric)
-    le,  // less-or-equal (numeric)
+    gt, // greater-than (numeric)
+    lt, // less-than (numeric)
+    ge, // greater-or-equal (numeric)
+    le, // less-or-equal (numeric)
 };
 
 const jwt_require_rule = extern struct {
@@ -211,7 +220,7 @@ const jwt_ctx = extern struct {
 // Comptime lookup table: maps ASCII byte → 6-bit value, 0xFF = invalid.
 // Handles base64url alphabet directly (-→62, _→63) so no pre-pass needed.
 const b64url_table: [256]u8 = blk: {
-    var t = [_]u8{0xFF} ** 256;
+    var t: [256]u8 = @splat(0xFF);
     const std_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     for (std_chars, 0..) |c, i| t[c] = @intCast(i);
     t['-'] = 62; // base64url uses - instead of +
@@ -352,11 +361,11 @@ fn algo_info(alg: Algorithm) JwtSigInfo {
 
 fn algo_from_str(s: []const u8) ?Algorithm {
     const algs = [_]struct { []const u8, Algorithm }{
-        .{ "HS256", .HS256 }, .{ "HS384", .HS384 }, .{ "HS512", .HS512 },
-        .{ "RS256", .RS256 }, .{ "RS384", .RS384 }, .{ "RS512", .RS512 },
-        .{ "ES256", .ES256 }, .{ "ES384", .ES384 }, .{ "ES512", .ES512 },
-        .{ "ES256K", .ES256K }, .{ "EdDSA", .EdDSA },
-        .{ "PS256", .PS256 }, .{ "PS384", .PS384 }, .{ "PS512", .PS512 },
+        .{ "HS256", .HS256 },   .{ "HS384", .HS384 }, .{ "HS512", .HS512 },
+        .{ "RS256", .RS256 },   .{ "RS384", .RS384 }, .{ "RS512", .RS512 },
+        .{ "ES256", .ES256 },   .{ "ES384", .ES384 }, .{ "ES512", .ES512 },
+        .{ "ES256K", .ES256K }, .{ "EdDSA", .EdDSA }, .{ "PS256", .PS256 },
+        .{ "PS384", .PS384 },   .{ "PS512", .PS512 },
     };
     for (algs) |entry| {
         if (std.mem.eql(u8, s, entry[0])) return entry[1];
@@ -1150,9 +1159,15 @@ fn create_jwt_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     return null;
 }
 
-fn create_main_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque { return create_jwt_conf(cf); }
-fn create_srv_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque { return create_jwt_conf(cf); }
-fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque { return create_jwt_conf(cf); }
+fn create_main_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
+    return create_jwt_conf(cf);
+}
+fn create_srv_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
+    return create_jwt_conf(cf);
+}
+fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
+    return create_jwt_conf(cf);
+}
 
 fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) callconv(.c) [*c]u8 {
     _ = cf;
@@ -1243,8 +1258,12 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     return conf.NGX_CONF_OK;
 }
 
-fn merge_srv_conf(cf: [*c]ngx_conf_t, p: ?*anyopaque, c: ?*anyopaque) callconv(.c) [*c]u8 { return merge_jwt_conf(cf, p, c); }
-fn merge_loc_conf(cf: [*c]ngx_conf_t, p: ?*anyopaque, c: ?*anyopaque) callconv(.c) [*c]u8 { return merge_jwt_conf(cf, p, c); }
+fn merge_srv_conf(cf: [*c]ngx_conf_t, p: ?*anyopaque, c: ?*anyopaque) callconv(.c) [*c]u8 {
+    return merge_jwt_conf(cf, p, c);
+}
+fn merge_loc_conf(cf: [*c]ngx_conf_t, p: ?*anyopaque, c: ?*anyopaque) callconv(.c) [*c]u8 {
+    return merge_jwt_conf(cf, p, c);
+}
 
 fn ngx_conf_set_jwt_secret(
     cf: [*c]ngx_conf_t,
@@ -1633,9 +1652,7 @@ fn ngx_conf_set_jwt_validate_exp(
         var index: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index)) |arg| {
             const s = core.slicify(u8, arg.*.data, arg.*.len);
-            if (std.mem.eql(u8, s, "on")) lccf.*.validate_exp = 1
-            else if (std.mem.eql(u8, s, "off")) lccf.*.validate_exp = 0
-            else return conf.NGX_CONF_ERROR;
+            if (std.mem.eql(u8, s, "on")) lccf.*.validate_exp = 1 else if (std.mem.eql(u8, s, "off")) lccf.*.validate_exp = 0 else return conf.NGX_CONF_ERROR;
         }
     }
     return conf.NGX_CONF_OK;
@@ -1739,9 +1756,7 @@ fn ngx_conf_set_jwt_validate_sig(
         var index: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index)) |arg| {
             const s = core.slicify(u8, arg.*.data, arg.*.len);
-            if (std.mem.eql(u8, s, "on")) lccf.*.validate_sig = 1
-            else if (std.mem.eql(u8, s, "off")) lccf.*.validate_sig = 0
-            else return conf.NGX_CONF_ERROR;
+            if (std.mem.eql(u8, s, "on")) lccf.*.validate_sig = 1 else if (std.mem.eql(u8, s, "off")) lccf.*.validate_sig = 0 else return conf.NGX_CONF_ERROR;
         }
     }
     return conf.NGX_CONF_OK;
@@ -1788,9 +1803,7 @@ fn ngx_conf_set_jwt_phase(
         var index: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index)) |arg| {
             const s = core.slicify(u8, arg.*.data, arg.*.len);
-            if (std.mem.eql(u8, s, "preaccess")) lccf.*.phase = 1
-            else if (std.mem.eql(u8, s, "access")) lccf.*.phase = 0
-            else return conf.NGX_CONF_ERROR;
+            if (std.mem.eql(u8, s, "preaccess")) lccf.*.phase = 1 else if (std.mem.eql(u8, s, "access")) lccf.*.phase = 0 else return conf.NGX_CONF_ERROR;
         }
     }
     return conf.NGX_CONF_OK;
@@ -1810,7 +1823,10 @@ fn ngx_conf_set_jwt_header(
         const var_name = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return conf.NGX_CONF_ERROR;
         const hdr_name = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return conf.NGX_CONF_ERROR;
         var vn = var_name.*;
-        if (vn.len > 0 and vn.data[0] == '$') { vn.data += 1; vn.len -= 1; }
+        if (vn.len > 0 and vn.data[0] == '$') {
+            vn.data += 1;
+            vn.len -= 1;
+        }
         if (core.ngz_pcalloc_c(ngx_str_t, cf.*.pool)) |name_copy| {
             name_copy.* = hdr_name.*;
             if (http.ngx_http_add_variable(cf, &vn, http.NGX_HTTP_VAR_NOCACHEABLE)) |variable| {
@@ -2287,23 +2303,23 @@ test "base64url_decode: output buffer too small returns null" {
 test "base64url_decode: large input fits when output buffer is sufficient" {
     // 5000 'A' chars decode to 3750 bytes; no artificial input-size limit
     var out: [4096]u8 = undefined;
-    const big: [5000]u8 = [_]u8{'A'} ** 5000;
+    const big: [5000]u8 = @splat('A');
     try expect(base64url_decode(&big, &out) != null);
 }
 
 test "base64url_decode: large input rejected when output buffer is too small" {
     var out: [16]u8 = undefined;
-    const big: [5000]u8 = [_]u8{'A'} ** 5000;
+    const big: [5000]u8 = @splat('A');
     try expect(base64url_decode(&big, &out) == null);
 }
 
 test "algo_from_str: all 14 algorithms" {
     const cases = [_][]const u8{
-        "HS256", "HS384", "HS512",
-        "RS256", "RS384", "RS512",
-        "ES256", "ES384", "ES512", "ES256K",
-        "PS256", "PS384", "PS512",
-        "EdDSA",
+        "HS256",  "HS384", "HS512",
+        "RS256",  "RS384", "RS512",
+        "ES256",  "ES384", "ES512",
+        "ES256K", "PS256", "PS384",
+        "PS512",  "EdDSA",
     };
     for (cases) |name| {
         try expect(algo_from_str(name) != null);
@@ -2450,7 +2466,7 @@ test "hmac_verify: HS256 known answer" {
 test "hmac_verify: wrong signature rejects" {
     const key = "benchmark-secret-hs256";
     const data = "test message";
-    var bad_sig = [_]u8{0} ** 32;
+    var bad_sig: [32]u8 = @splat(0);
     try expect(!hmac_verify(data, &bad_sig, key, EVP_sha256(), 32));
 }
 
@@ -2471,7 +2487,7 @@ test "hmac_verify: tampered message rejects" {
 test "hmac_verify: wrong signature length rejects" {
     const key = "benchmark-secret-hs256";
     const data = "test message";
-    var short_sig = [_]u8{0} ** 4;
+    var short_sig: [4]u8 = @splat(0);
     try expect(!hmac_verify(data, &short_sig, key, EVP_sha256(), 32));
 }
 
@@ -2492,16 +2508,16 @@ test "hmac_verify: HS512 known answer" {
 test "hmac_verify: wrong HS384 signature rejects" {
     const key = "benchmark-secret-hs384-32-bytes!!!!!!";
     const data = "test message";
-    var bad_sig = [_]u8{0} ** 48;
+    var bad_sig: [48]u8 = @splat(0);
     try expect(!hmac_verify(data, &bad_sig, key, EVP_sha384(), 48));
 }
 
 test "hmac_verify: HS256 with long key" {
-    const key = "A" ** 200; // 200-byte key
+    const key: [200]u8 = @splat('A'); // 200-byte key
     const data = "short";
     // Expected HMAC-SHA256 computed via Python
     const expected = try hexToBytes("fb7b1f65db47f74705c727c97c72cc387d1523a90de198a094b31559a87b825c");
-    try expect(hmac_verify(data, expected[0..32], key, EVP_sha256(), 32));
+    try expect(hmac_verify(data, expected[0..32], &key, EVP_sha256(), 32));
 }
 
 test "hmac_md_for: correct digest per algorithm" {
@@ -2529,19 +2545,19 @@ test "struct layout: JwtKeyRequestRuntime size" {
 }
 
 test "struct layout: ClaimOp discriminant values are ordered starting from 0" {
-    try expectEqual(@intFromEnum(ClaimOp.eq), @as(u8, 0));
-    try expectEqual(@intFromEnum(ClaimOp.neq), @as(u8, 1));
-    try expectEqual(@intFromEnum(ClaimOp.gt), @as(u8, 2));
-    try expectEqual(@intFromEnum(ClaimOp.lt), @as(u8, 3));
-    try expectEqual(@intFromEnum(ClaimOp.ge), @as(u8, 4));
-    try expectEqual(@intFromEnum(ClaimOp.le), @as(u8, 5));
+    try expectEqual(@backingInt(ClaimOp.eq), @as(u8, 0));
+    try expectEqual(@backingInt(ClaimOp.neq), @as(u8, 1));
+    try expectEqual(@backingInt(ClaimOp.gt), @as(u8, 2));
+    try expectEqual(@backingInt(ClaimOp.lt), @as(u8, 3));
+    try expectEqual(@backingInt(ClaimOp.ge), @as(u8, 4));
+    try expectEqual(@backingInt(ClaimOp.le), @as(u8, 5));
 }
 
 test "struct layout: Algorithm discriminant values" {
-    try expectEqual(@intFromEnum(Algorithm.HS256), @as(u8, 0));
-    try expectEqual(@intFromEnum(Algorithm.HS384), @as(u8, 1));
-    try expectEqual(@intFromEnum(Algorithm.HS512), @as(u8, 2));
-    try expectEqual(@intFromEnum(Algorithm.RS256), @as(u8, 3));
+    try expectEqual(@backingInt(Algorithm.HS256), @as(u8, 0));
+    try expectEqual(@backingInt(Algorithm.HS384), @as(u8, 1));
+    try expectEqual(@backingInt(Algorithm.HS512), @as(u8, 2));
+    try expectEqual(@backingInt(Algorithm.RS256), @as(u8, 3));
 }
 
 test "ngx_str_t helper constructs correctly" {

@@ -137,8 +137,7 @@ fn get_or_create_request_id(r: [*c]ngx_http_request_t, lccf: [*c]requestid_loc_c
     // Generate new UUID4
     if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, UUID4_LEN))) |buf| {
         if (!generate_uuid4(buf)) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0,
-                "requestid: entropy acquisition failed", .{});
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0, "requestid: entropy acquisition failed", .{});
             return null;
         }
         ctx.*.request_id = ngx_str_t{ .len = UUID4_LEN, .data = buf };
@@ -410,8 +409,7 @@ test "uuid4 generation" {
     try expect(buf[19] == '8' or buf[19] == '9' or buf[19] == 'a' or buf[19] == 'b');
 }
 
-test "requestid module" {
-}
+test "requestid module" {}
 
 test "incoming request ids are bounded and visible ASCII" {
     const valid = ngx_string("trace-123_ABC");
@@ -420,6 +418,6 @@ test "incoming request ids are bounded and visible ASCII" {
     try expect(!valid_incoming_request_id(empty));
     var control = [_]u8{ 'a', '\n', 'b' };
     try expect(!valid_incoming_request_id(.{ .data = &control, .len = control.len }));
-    var oversized = [_]u8{'x'} ** (MAX_ACCEPTED_REQUEST_ID_LEN + 1);
+    var oversized: [MAX_ACCEPTED_REQUEST_ID_LEN + 1]u8 = @splat('x');
     try expect(!valid_incoming_request_id(.{ .data = &oversized, .len = oversized.len }));
 }

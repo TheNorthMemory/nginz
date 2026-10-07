@@ -126,8 +126,8 @@ const dynamic_upstreams_loc_conf = extern struct {
     journal_path: ngx_str_t,
     journal_registered: ngx_flag_t,
     // consul source fields
-    consul_host: ngx_str_t,     // null-terminated IP string
-    consul_port: ngx_uint_t,    // default 8500
+    consul_host: ngx_str_t, // null-terminated IP string
+    consul_port: ngx_uint_t, // default 8500
     consul_service: ngx_str_t,
     consul_tag: ngx_str_t,
     consul_token: ngx_str_t,
@@ -192,8 +192,8 @@ const DrainEntry = extern struct {
 // Control block — one per managed upstream, lives in the slab pool.
 const UpstreamStore = extern struct {
     next_generation: u64,
-    active: ?*anyopaque,         // *Snapshot, swapped atomically under shmtx
-    draining_head: ?*anyopaque,  // *Snapshot linked list of draining snapshots
+    active: ?*anyopaque, // *Snapshot, swapped atomically under shmtx
+    draining_head: ?*anyopaque, // *Snapshot linked list of draining snapshots
     pin_readers: c_ulong,
     last_error_code: u32,
     last_error_at_msec: i64,
@@ -209,7 +209,7 @@ const UpstreamStore = extern struct {
 // Immutable peer snapshot, pinned per-request.
 const Snapshot = extern struct {
     generation: u64,
-    refcount: c_ulong,      // ngx_atomic_uint_t — modified via @atomicRmw
+    refcount: c_ulong, // ngx_atomic_uint_t — modified via @atomicRmw
     draining: ngx_flag_t,
     peer_count: ngx_uint_t,
     peers: [*c]ngx_http_upstream_rr_peers_t,
@@ -219,9 +219,9 @@ const Snapshot = extern struct {
 // ── Vtable ────────────────────────────────────────────────────────────────────
 
 const du_vtable = PeerSourceVTable{
-    .get_active_peers = @constCast(@ptrCast(&du_get_active_peers)),
-    .release_generation = @constCast(@ptrCast(&du_release_generation)),
-    .is_peer_draining = @constCast(@ptrCast(&ngz_du_is_peer_draining_in_upstream)),
+    .get_active_peers = @ptrCast(@constCast(&du_get_active_peers)),
+    .release_generation = @ptrCast(@constCast(&du_release_generation)),
+    .is_peer_draining = @ptrCast(@constCast(&ngz_du_is_peer_draining_in_upstream)),
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -627,8 +627,7 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (c.*.consul_dc.len == 0) c.*.consul_dc = prev.*.consul_dc;
 
     if (c.*.api_enabled != 0 and c.*.target_uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-            "dynamic_upstreams: dynamic_upstreams_target is required when dynamic_upstreams_api is enabled\x00", .{});
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: dynamic_upstreams_target is required when dynamic_upstreams_api is enabled\x00", .{});
         return conf.NGX_CONF_ERROR;
     }
 
@@ -725,7 +724,7 @@ export fn ngz_du_is_peer_draining_in_upstream(
     const ducf = core.castPtr(DynamicUpstreamsSrvConf, source_ctx) orelse return 0;
     const store_cptr = ducf.*.store;
     if (store_cptr == core.nullptr(UpstreamStore)) return 0;
-    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+    const store: *UpstreamStore = @ptrCast(@alignCast(store_cptr));
     const addr = core.slicify(u8, addr_data, addr_len);
     return if (peer_is_marked_draining(ducf, store, addr)) 1 else 0;
 }
@@ -739,7 +738,7 @@ export fn ngz_du_is_peer_draining(addr_data: [*c]u8, addr_len: usize) callconv(.
         const ducf = managed_ducfs[i];
         const store_cptr = ducf.*.store;
         if (store_cptr == core.nullptr(UpstreamStore)) continue;
-        const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+        const store: *UpstreamStore = @ptrCast(@alignCast(store_cptr));
         if (peer_is_marked_draining(ducf, store, addr)) return 1;
     }
     return 0;
@@ -766,15 +765,13 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
 
         // Install the balancer's init_peer wrapper (needed so peer source is used)
         if (upstream_balancer_ensure_hook(uscf) != core.NGX_OK) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                "dynamic_upstreams: upstream_balancer_ensure_hook failed\x00", .{});
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: upstream_balancer_ensure_hook failed\x00", .{});
             return core.NGX_ERROR;
         }
 
         // Register this module as the peer source for this upstream
         if (upstream_balancer_register_peer_source(uscf, ducf, &du_vtable) != core.NGX_OK) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                "dynamic_upstreams: register_peer_source failed\x00", .{});
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: register_peer_source failed\x00", .{});
             return core.NGX_ERROR;
         }
     }
@@ -869,9 +866,7 @@ fn set_dynamic_upstreams_source(
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const val = core.slicify(u8, arg.*.data, arg.*.len);
             if (!std.mem.eql(u8, val, "static") and !std.mem.eql(u8, val, "consul")) {
-                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                    "dynamic_upstreams: unsupported source '%.*s'; supported: static, consul\x00",
-                    .{ @as(c_int, @intCast(arg.*.len)), arg.*.data });
+                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: unsupported source '%.*s'; supported: static, consul\x00", .{ @as(c_int, @intCast(arg.*.len)), arg.*.data });
                 return conf.NGX_CONF_ERROR;
             }
             lccf.*.source = arg.*;
@@ -915,8 +910,7 @@ fn set_dynamic_upstreams_target(
             lccf.*.target = arg.*;
             // Resolve at config parse time for fast access at request time
             lccf.*.target_uscf = find_upstream_by_name(cf, arg.*) orelse {
-                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                    "dynamic_upstreams: target upstream not found\x00", .{});
+                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: target upstream not found\x00", .{});
                 return conf.NGX_CONF_ERROR;
             };
         }
@@ -935,13 +929,11 @@ fn set_dynamic_upstreams_refresh(
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
             lccf.*.refresh_ms = std.fmt.parseInt(ngx_uint_t, slice, 10) catch {
-                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                    "dynamic_upstreams: refresh must be a positive integer milliseconds value\x00", .{});
+                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: refresh must be a positive integer milliseconds value\x00", .{});
                 return conf.NGX_CONF_ERROR;
             };
             if (lccf.*.refresh_ms == 0) {
-                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                    "dynamic_upstreams: refresh must be greater than zero\x00", .{});
+                ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0, "dynamic_upstreams: refresh must be greater than zero\x00", .{});
                 return conf.NGX_CONF_ERROR;
             }
         }
@@ -1061,8 +1053,7 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
 
     const uscf = lccf.*.target_uscf;
     if (uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
-        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target upstream not configured\"}"));
+        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target upstream not configured\"}"));
     }
 
     const ducf = get_ducf(uscf);
@@ -1117,7 +1108,7 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
     else
         0;
     const drain_count: u32 = if (managed and ducf != null and ducf.?.*.store != core.nullptr(UpstreamStore)) blk: {
-        const s: *UpstreamStore = @alignCast(@ptrCast(ducf.?.*.store));
+        const s: *UpstreamStore = @ptrCast(@alignCast(ducf.?.*.store));
         break :blk @atomicLoad(u32, &s.drain_count, .acquire);
     } else 0;
 
@@ -1341,7 +1332,7 @@ fn collect_current_peer_specs(
     if (store_cptr == core.nullptr(UpstreamStore)) {
         return .{ .err = .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store unavailable\"}") } };
     }
-    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+    const store: *UpstreamStore = @ptrCast(@alignCast(store_cptr));
 
     var pinned_token: u64 = 0;
     var generation: u64 = 0;
@@ -1868,7 +1859,7 @@ fn activate_snapshot_from_specs(
     store.*.drain_count = 0;
 
     const old_active = store.*.active;
-    const store_typed: *UpstreamStore = @alignCast(@ptrCast(store));
+    const store_typed: *UpstreamStore = @ptrCast(@alignCast(store));
     @atomicStore(usize, @as(*usize, @ptrCast(&store_typed.active)), @intFromPtr(new_snapshot), .release);
     store.*.next_generation = gen + 1;
     if (old_active) |old_ptr| {
@@ -1954,26 +1945,22 @@ fn handle_put(r: [*c]ngx_http_request_t) ngx_int_t {
 
     const uscf = lccf.*.target_uscf;
     if (uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
-        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target not configured\"}"));
+        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target not configured\"}"));
     }
 
     const ducf = get_ducf(uscf) orelse return core.NGX_ERROR;
     if (ducf.*.managed == 0) {
-        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"upstream is not managed\"}"));
+        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"upstream is not managed\"}"));
     }
 
     if (ducf.*.zone == core.nullptr(core.ngx_shm_zone_t) or ducf.*.store == core.nullptr(UpstreamStore)) {
-        return send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store not initialized\"}"));
+        return send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store not initialized\"}"));
     }
 
     if (!is_json_content_type(r)) {
         record_store_error(ducf, DU_ERROR_INVALID_CONTENT_TYPE);
         _ = http.ngx_http_discard_request_body(r);
-        return send_json_response(r, 415,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"content-type must be application/json\"}"));
+        return send_json_response(r, 415, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"content-type must be application/json\"}"));
     }
 
     const rc = http.ngx_http_read_client_request_body(r, du_put_body_handler);
@@ -2000,15 +1987,13 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     if (r.*.request_body == core.nullptr(http.ngx_http_request_body_t) or
         r.*.request_body.*.bufs == core.nullptr(ngx_chain_t))
     {
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"missing request body\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"missing request body\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
 
     const body_str = buf.ngz_chain_content(r.*.request_body.*.bufs, r.*.pool) catch {
-        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to read body\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to read body\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     };
@@ -2017,8 +2002,7 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     var cj = CJSON.init(r.*.pool);
     const json = cj.decode(body_str) catch {
         record_store_error(ducf, DU_ERROR_INVALID_JSON);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid JSON\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid JSON\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     };
@@ -2032,9 +2016,7 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         },
         .ok => |ok| {
             var resp_buf: [128]u8 = undefined;
-            const resp = std.fmt.bufPrint(&resp_buf,
-                "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"generation\":{d},\"peer_count\":{d}}}",
-                .{ ok.generation, ok.peer_count }) catch {
+            const resp = std.fmt.bufPrint(&resp_buf, "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"generation\":{d},\"peer_count\":{d}}}", .{ ok.generation, ok.peer_count }) catch {
                 http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             };
@@ -2060,22 +2042,18 @@ fn handle_patch(r: [*c]ngx_http_request_t) ngx_int_t {
 
     const uscf = lccf.*.target_uscf;
     if (uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
-        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target not configured\"}"));
+        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target not configured\"}"));
     }
     const ducf = get_ducf(uscf) orelse return core.NGX_ERROR;
     if (ducf.*.managed == 0) {
-        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"upstream is not managed\"}"));
+        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"upstream is not managed\"}"));
     }
     if (ducf.*.zone == core.nullptr(core.ngx_shm_zone_t) or ducf.*.store == core.nullptr(UpstreamStore)) {
-        return send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store not initialized\"}"));
+        return send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store not initialized\"}"));
     }
     if (!is_json_content_type(r)) {
         _ = http.ngx_http_discard_request_body(r);
-        return send_json_response(r, 415,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"content-type must be application/json\"}"));
+        return send_json_response(r, 415, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"content-type must be application/json\"}"));
     }
     const rc = http.ngx_http_read_client_request_body(r, du_patch_body_handler);
     if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
@@ -2100,15 +2078,13 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     if (r.*.request_body == core.nullptr(http.ngx_http_request_body_t) or
         r.*.request_body.*.bufs == core.nullptr(ngx_chain_t))
     {
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"missing request body\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"missing request body\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
 
     const body_str = buf.ngz_chain_content(r.*.request_body.*.bufs, r.*.pool) catch {
-        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to read body\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to read body\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     };
@@ -2116,8 +2092,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     var cj = CJSON.init(r.*.pool);
     const json = cj.decode(body_str) catch {
         record_store_error(ducf, DU_ERROR_INVALID_JSON);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid JSON\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid JSON\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     };
@@ -2125,8 +2100,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
 
     if (cjson.cJSON_IsObject(json) != 1) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH body must be a JSON object\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH body must be a JSON object\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
@@ -2153,32 +2127,28 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
             continue;
         }
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"unsupported PATCH field\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"unsupported PATCH field\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
 
     if (is_drain and is_undrain) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'drain' and 'undrain' are mutually exclusive\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'drain' and 'undrain' are mutually exclusive\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
 
     if ((is_drain or is_undrain) and has_membership_patch) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain/undrain cannot be mixed with add/remove/replace\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain/undrain cannot be mixed with add/remove/replace\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
 
     if (!is_drain and !is_undrain and !has_membership_patch) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH requires drain/undrain or add/remove/replace\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH requires drain/undrain or add/remove/replace\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
@@ -2189,8 +2159,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
             (replace_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsArray(replace_node) != 1))
         {
             record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-            _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-                ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"add/remove/replace must be arrays\"}"));
+            _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"add/remove/replace must be arrays\"}"));
             http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
             return;
         }
@@ -2230,12 +2199,10 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         }
 
         var rbuf: [224]u8 = undefined;
-        const resp = std.fmt.bufPrint(&rbuf,
-            "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"patch\",\"changed\":{s},\"added\":{d},\"removed\":{d},\"generation\":{d},\"peer_count\":{d}}}",
-            .{ if (plan.changed) "true" else "false", plan.added, plan.removed, generation, peer_count }) catch {
-                http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
-                return;
-            };
+        const resp = std.fmt.bufPrint(&rbuf, "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"patch\",\"changed\":{s},\"added\":{d},\"removed\":{d},\"generation\":{d},\"peer_count\":{d}}}", .{ if (plan.changed) "true" else "false", plan.added, plan.removed, generation, peer_count }) catch {
+            http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        };
         const resp_mem = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, resp.len)) orelse {
             http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
@@ -2250,39 +2217,34 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     const addr_ngx = if (is_drain) CJSON.stringValue(drain_node) else CJSON.stringValue(undrain_node);
     const addr_str = addr_ngx orelse {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be non-empty\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be non-empty\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     };
     if (addr_str.len == 0 or addr_str.len > 64) {
         record_store_error(ducf, DU_ERROR_INVALID_PEER);
-        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be 1..64 bytes\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be 1..64 bytes\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
     }
     const addr = core.slicify(u8, addr_str.data, addr_str.len);
 
     const shpool = get_shpool(ducf.*.zone) orelse {
-        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"slab pool unavailable\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"slab pool unavailable\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_SERVICE_UNAVAILABLE);
         return;
     };
     const store_cptr = ducf.*.store;
     if (store_cptr == core.nullptr(UpstreamStore)) {
-        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store unavailable\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store unavailable\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_SERVICE_UNAVAILABLE);
         return;
     }
-    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+    const store: *UpstreamStore = @ptrCast(@alignCast(store_cptr));
 
     if (is_drain and !peer_exists_in_current_generation_or_static(ducf, uscf, store, addr)) {
         record_store_error(ducf, DU_ERROR_INVALID_PEER);
-        _ = send_json_response(r, http.NGX_HTTP_NOT_FOUND,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer address not present in current upstream\"}"));
+        _ = send_json_response(r, http.NGX_HTTP_NOT_FOUND, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer address not present in current upstream\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_NOT_FOUND);
         return;
     }
@@ -2304,8 +2266,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
             }
             if (store.drain_count >= MAX_DRAIN_PEERS) {
                 shm.ngx_shmtx_unlock(&shpool.*.mutex);
-                _ = send_json_response(r, 409,
-                    ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain table full\"}"));
+                _ = send_json_response(r, 409, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain table full\"}"));
                 http.ngx_http_finalize_request(r, 409);
                 return;
             }
@@ -2357,9 +2318,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
 
     var rbuf: [192]u8 = undefined;
     const action = if (is_drain) "drain" else "undrain";
-    const resp = std.fmt.bufPrint(&rbuf,
-        "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"{s}\",\"address\":\"{s}\",\"drain_count\":{d}}}",
-        .{ action, addr, new_count }) catch {
+    const resp = std.fmt.bufPrint(&rbuf, "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"{s}\",\"address\":\"{s}\",\"drain_count\":{d}}}", .{ action, addr, new_count }) catch {
         http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     };
@@ -2664,7 +2623,7 @@ fn consul_refresh_drive_read(ctx: *ConsulRefreshCtx) void {
 fn consul_refresh_write_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
     const c = core.castPtr(core.ngx_connection_t, ev.*.data) orelse return;
     const ctx_cptr = core.castPtr(ConsulRefreshCtx, c.*.data) orelse return;
-    const ctx: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_cptr));
+    const ctx: *ConsulRefreshCtx = @ptrCast(@alignCast(ctx_cptr));
 
     if (ev.*.flags.timedout) {
         ev.*.flags.timedout = false;
@@ -2679,7 +2638,7 @@ fn consul_refresh_write_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
 fn consul_refresh_read_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
     const c = core.castPtr(core.ngx_connection_t, ev.*.data) orelse return;
     const ctx_cptr = core.castPtr(ConsulRefreshCtx, c.*.data) orelse return;
-    const ctx: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_cptr));
+    const ctx: *ConsulRefreshCtx = @ptrCast(@alignCast(ctx_cptr));
 
     if (ev.*.flags.timedout) {
         ev.*.flags.timedout = false;
@@ -2699,8 +2658,7 @@ fn consul_peers_json(
 ) ?ngx_str_t {
     var cj = CJSON.init(pool);
     const parsed = cj.decode(consul_body) catch {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
-            "consul: failed to parse health response JSON\x00", .{});
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: failed to parse health response JSON\x00", .{});
         return null;
     };
     // Pool-allocated; freed with pool at end of run_consul_refresh_entry.
@@ -2860,7 +2818,7 @@ fn run_consul_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) voi
         record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
         return;
     };
-    const ctx_mem: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_mem_cptr));
+    const ctx_mem: *ConsulRefreshCtx = @ptrCast(@alignCast(ctx_mem_cptr));
 
     ctx_mem.* = .{
         .entry = entry,
@@ -3012,7 +2970,7 @@ fn du_get_active_peers(
     const store_cptr = ducf.*.store;
     if (store_cptr == core.nullptr(UpstreamStore)) return core.nullptr(ngx_http_upstream_rr_peers_t);
     // Cast away [*c] so that field-level atomic ops compile correctly.
-    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+    const store: *UpstreamStore = @ptrCast(@alignCast(store_cptr));
 
     // Lockless snapshot pinning with a reader guard:
     // readers increment store.pin_readers before loading store.active.
@@ -3070,8 +3028,7 @@ export fn ngx_http_dynamic_upstreams_handler(r: [*c]ngx_http_request_t) callconv
         return handle_patch(r);
     } else {
         _ = http.ngx_http_discard_request_body(r);
-        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"method not allowed\"}"));
+        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED, ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"method not allowed\"}"));
     }
 }
 
