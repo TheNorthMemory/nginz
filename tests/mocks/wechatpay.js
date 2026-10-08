@@ -109,7 +109,9 @@ export function verifyProxyAuthorization(header, {
 
   const verifier = createVerify("RSA-SHA256");
   const target = query ? `${path}?${query}` : path;
-  verifier.update(`${method}\n${target}\n${params.timestamp}\n${params.nonce_str}\n${body}\n`);
+  verifier.update(`${method}\n${target}\n${params.timestamp}\n${params.nonce_str}\n`);
+  verifier.update(body);
+  verifier.update("\n");
   verifier.end();
   return verifier.verify(publicKey, params.signature, "base64");
 }

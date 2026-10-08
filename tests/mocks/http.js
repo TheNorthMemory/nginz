@@ -42,6 +42,7 @@ export class HTTPMock {
     killStaleListeners(this.port);
     this.server = Bun.serve({
       port: this.port,
+      hostname: '127.0.0.1',
       fetch: (req) => this.handleRequest(req),
     });
     return this;

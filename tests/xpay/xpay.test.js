@@ -12,6 +12,39 @@ const TOKEN = 'xpay-test-token+/=&?# 空格';
 const LIVE_KEY = 'xpay-test-live-key';
 const SANDBOX_KEY = 'xpay-test-sandbox-key';
 const BODY = '{ "env": 0, "order_id":"单\\u00261", "openid":"test-openid" }';
+// Keep malformed-input regression traffic on synthetic loopback fixtures.
+if (!['localhost', '127.0.0.1'].includes(new URL(TEST_URL).hostname)) {
+    throw new Error('payment body regressions require a loopback fixture');
+}
+const malformedBodies = [
+    ['whitespace only', ' \t\r\n'],
+    ...['null', 'true', 'false', '0', '"env"', '[{"env":0}]'].map(body => ['non-object ' + body, body]),
+    ...['null', 'true', 'false', '"0"', '[]', '{}', '2', '-1', '0.0', '-0', '1e0', '1e309', '9007199254740993'].map(env => ['invalid env ' + env, '{"env":' + env + '}']),
+    ['case-sensitive env key', '{"Env":0}'],
+    ['escaped duplicate env', '{"e\\u006ev":0,"env":0}'],
+    ['escaped duplicate nested key', '{"env":0,"x":{"a":1,"\\u0061":2}}'],
+    ['escaped signature field', '{"env":0,"signat\\u0075re":"forged"}'],
+    ['escaped access token field', '{"env":0,"access_\\u0074oken":"forged"}'],
+    ['single-quoted JSON', "{'env':0}"],
+    ['JSON comment', '{"env":0/*comment*/}'],
+    ['trailing comma', '{"env":0,}'],
+    ['concatenated documents', '{"env":0}{"env":0}'],
+    ['UTF-8 BOM', '\uFEFF{"env":0}'],
+    ['control character in string', '{"env":0,"x":"\u0001"}'],
+    ['lone high surrogate', '{"env":0,"x":"\\uD800"}'],
+    ['lone low surrogate', '{"env":0,"x":"\\uDC00"}'],
+    ['reversed surrogate pair', '{"env":0,"x":"\\uDC00\\uD800"}'],
+    ['excessive nesting', '{"env":0,"x":' + '['.repeat(300) + '0' + ']'.repeat(300) + '}'],
+    ...[
+        ['overlong UTF-8', [0xc0, 0xaf]],
+        ['truncated UTF-8', [0xe2, 0x82]],
+        ['UTF-8 surrogate', [0xed, 0xa0, 0x80]],
+        ['out-of-range UTF-8', [0xf4, 0x90, 0x80, 0x80]],
+        ['stray continuation byte', [0x80]],
+    ].map(([name, bytes]) => [name, Buffer.concat([Buffer.from('{"env":0,"x":"'), Buffer.from(bytes), Buffer.from('"}')])]),
+    ...Array.from({length: BODY.length}, (_, length) => ['truncated document at ' + length, BODY.slice(0, length)])
+        .filter(([, body]) => !body.trimEnd().endsWith('}')),
+];
 let mock;
 const post = (path, body = BODY, extra = {}) => fetch(TEST_URL + path, {
     method: 'POST', body, ...extra,
@@ -72,7 +105,8 @@ describe('XPay pass-through', () => {
         await stopNginz();
         mock.stop();
         const log = readFileSync('tests/xpay/runtime/logs/error.log', 'utf8');
-        expect(log).not.toMatch(/\[alert\]|\[crit\]|header already sent|pending events while closing request|signal 11/);
+        const failures = log.split('\n').filter(line => /\[alert\]|\[crit\]|header already sent|pending events while closing request|exited on signal/.test(line));
+        expect(failures).toEqual([]);
         cleanupRuntime('xpay');
     });
 
@@ -177,6 +211,15 @@ describe('XPay pass-through', () => {
         expect((await call('')).status).toBe(400);
         expect((await call(BODY, '/xpay/no_token')).status).toBe(500);
         expect(mock.requestCount).toBe(0);
+    });
+
+    test.each(malformedBodies)('rejects %s directly and through QuickJS, then serves a valid payment', async (_, body) => {
+        expect((await post('/xpay/query_order', body)).status).toBe(400);
+        expect((await call(body)).status).toBe(400);
+        expect(mock.requestCount).toBe(0);
+        mock.post('/xpay/query_order', () => ({body: '{"errcode":0}'}));
+        expect((await post('/xpay/query_order')).status).toBe(200);
+        expect(mock.requestCount).toBe(1);
     });
 
     test('signs catalog endpoints with the same exact-body protocol', async () => {
@@ -319,7 +362,7 @@ describe('XPay configuration', () => {
             client_body_temp_path client_temp; proxy_temp_path proxy_temp;
             fastcgi_temp_path fastcgi_temp; uwsgi_temp_path uwsgi_temp; scgi_temp_path scgi_temp;
             variables_hash_max_size 2048; variables_hash_bucket_size 128; ${global}
-            server { listen 18888; location /xpay/query_order { ${directives} } } }`);
+            server { listen 127.0.0.1:18888; location /xpay/query_order { ${directives} } } }`);
         const proc = Bun.spawnSync([binary, '-t', '-e', 'stderr', '-p', dir, '-c', config]);
         return { code: proc.exitCode, output: proc.stderr.toString() };
     }
@@ -370,7 +413,7 @@ describe('XPay key rotation', () => {
                 wechatpay_xpay_access_token rotation-token;
                 wechatpay_xpay_auth appkey;
                 wechatpay_xpay_live_key_file ${join(dir, 'live.key')};
-                server { listen 8888; location /xpay/query_order {
+                server { listen 127.0.0.1:8888; location /xpay/query_order {
                     wechatpay_xpay_proxy_pass http://127.0.0.1:19001;
                 } }
             }`);

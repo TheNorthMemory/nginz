@@ -74,6 +74,24 @@ Successful response verification is available as `$wechatpay_verification`
 (`success`), including for signed business errors such as `404 ORDER_NOT_EXIST`.
 A business error does not itself mean that signing or verification failed.
 
+API v3 request auditing supports bodyless requests, including order-status GETs,
+directly and as QuickJS subrequests. The audit contains the signed headers and exact
+body bytes, with `Content-Length: 0` for an empty body. API v3 forwards opaque
+payloads for the provider to validate; XPay validates its JSON/environment
+contract before auditing or dispatching. Audit rejection prevents dispatch.
+
+Run `ZIG_OPTIMIZE=ReleaseSafe bun test tests/wechatpay tests/xpay` to verify empty
+and file-buffered bodies, exact signatures/audit bytes, audit rejection, body
+bounds, invalid HTTP framing, malformed JSON and UTF-8, and parent/worker survival.
+ReleaseSafe is required to catch null-to-slice errors hidden by ReleaseSmall.
+The audit tests use QuickJS with upstream sources unchanged.
+Empty audit variables expose non-null empty storage so QuickJS can safely read
+them as zero-length Buffers, including when a request fails before dispatch.
+The test handlers pass an empty string for an empty body and request a Buffer
+only for nonempty bodies, preserving malformed bytes without invoking the
+upstream null-backed empty-Buffer constructor. All malformed-input traffic is
+bounded and uses loopback listeners, synthetic keys and mock providers.
+
 Instead of providing standard nginx building routines, the project artifacts are module object files,
 with which one shall build into a target `nginx` binary.
 

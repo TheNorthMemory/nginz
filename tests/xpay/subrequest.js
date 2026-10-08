@@ -3,7 +3,9 @@ function token(r) {
 }
 async function query(r) {
     const reply = await r.subrequest(r.args.target || '/xpay/query_order', {
-        method: 'POST', body: r.requestText || '',
+        // Avoid the upstream Buffer getter for a null-backed empty body.
+        // Preserve nonempty bytes, including malformed UTF-8, for validation.
+        method: 'POST', body: r.requestText ? r.requestBuffer : '',
     });
     r.return(200, JSON.stringify({
         status: reply.status,

@@ -787,7 +787,9 @@ fn wechatpay_audit_variable(r: [*c]ngx_http_request_t, v: [*c]http.ngx_http_vari
         5 => if (ctx.*.transport_complete) ngx_string("complete") else ngx_string("incomplete"),
         else => if (ctx.*.sig_verify == .SIG_VERIFICATION_SUCCESS) ngx_string("success") else ngx_string("unverified"),
     };
-    v.*.data = value.data;
+    // QuickJS rawVariables copies even zero-length values. Supply valid empty
+    // storage instead of exposing our zero-initialized context's null pointer.
+    v.*.data = @constCast(str_slice(value).ptr);
     v.*.flags.len = @intCast(value.len);
     v.*.flags.valid = true;
     v.*.flags.no_cacheable = true;
@@ -1311,7 +1313,9 @@ export fn ngx_http_wechatpay_proxy_body_handler(
                     return;
                 };
                 @memcpy(raw[0..rctx.*.prepared_headers.len], core.slicify(u8, rctx.*.prepared_headers.data, rctx.*.prepared_headers.len));
-                @memcpy(raw[rctx.*.prepared_headers.len..][0..body.len], core.slicify(u8, body.data, body.len));
+                // Bodyless API v3 requests use { null, 0 }; a Zig slice must
+                // still have a non-null pointer for a zero-byte audit copy.
+                @memcpy(raw[rctx.*.prepared_headers.len..][0..body.len], str_slice(body));
                 rctx.*.captured_request = .{ .data = raw, .len = size };
             }
             const ps = core.ngz_pcalloc_c(http.ngx_http_post_subrequest_t, r.*.pool) orelse {
